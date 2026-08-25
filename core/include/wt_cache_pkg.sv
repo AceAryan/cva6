@@ -89,4 +89,26 @@ package wt_cache_pkg;
     return size;
   endfunction : toSize32
 
+  // ------------------------------------------------
+  // Conditional Access (CA) state
+  // Added for CA implementation per paper:
+  // "Efficient Hardware Primitives for Immediate
+  //  Memory Reclamation in Optimistic Data Structures"
+  // ------------------------------------------------
+
+  // Per core CA state
+  // accessRevokedBit: set when tagged line invalidated
+  typedef struct packed {
+    logic access_revoked_bit;  // 1 = tagged line was invalidated
+    logic ca_enabled;          // 1 = CA mode active for this core
+  } ca_state_t;
+
+  // CA instruction type
+  typedef enum logic [1:0] {
+    CA_NONE     = 2'b00,  // normal access
+    CA_CREAD    = 2'b01,  // conditional read
+    CA_CWRITE   = 2'b10,  // conditional write
+    CA_UNTAG    = 2'b11   // untagOne or untagAll
+  } ca_op_t;
+
 endpackage

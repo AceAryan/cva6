@@ -54,7 +54,13 @@ module wt_dcache_ctrl
     input logic [CVA6Cfg.XLEN-1:0] rd_data_i,
     input logic [CVA6Cfg.DCACHE_USER_WIDTH-1:0] rd_user_i,
     input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_vld_bits_i,
-    input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_hit_oh_i
+    input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_hit_oh_i,
+    // CA ports
+    input logic ca_cread_i,
+    input logic ca_cwrite_i,
+    input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_ca_tag_bits_i,
+    output logic ca_access_revoked_o,
+    output logic ca_tag_set_o
 );
 
   // controller FSM
@@ -76,6 +82,10 @@ module wt_dcache_ctrl
   logic [CVA6Cfg.DcacheIdWidth-1:0] id_d, id_q;
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] vld_data_d, vld_data_q;
   logic save_tag, rd_req_d, rd_req_q, rd_ack_d, rd_ack_q;
+   // CA state registers
+  logic ca_access_revoked_d, ca_access_revoked_q;
+  logic ca_tag_active_d,     ca_tag_active_q;
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_tagged_addr_d, ca_tagged_addr_q;
   logic [1:0] data_size_d, data_size_q;
 
   ///////////////////////////////////////////////////////
@@ -109,9 +119,47 @@ module wt_dcache_ctrl
   ));
 
 
-  assign miss_we_o = '0;
+  assign miss_we_o    = '0;
   assign miss_wdata_o = '0;
   assign miss_wuser_o = '0;
+
+  // ------------------------------------------------
+  // CA Logic
+  // accessRevokedBit set when:
+  // 1. This core tagged a line (ca_cread)
+  // 2. Another core invalidated that line
+  //    detected via miss_rtrn_vld_i on tagged addr
+  // ------------------------------------------------
+  always_comb begin
+    ca_access_revoked_d = ca_access_revoked_q;
+    ca_tag_active_d     = ca_tag_active_q;
+    ca_tagged_addr_d    = ca_tagged_addr_q;
+
+    // cread — tag the address
+    if (ca_cread_i && req_port_o.data_gnt) begin
+      ca_tag_active_d  = 1'b1;
+      ca_tagged_addr_d = address_tag_d;
+    end
+
+    // Invalidation detected on tagged line
+    // miss_rtrn_vld_i means line was fetched
+    // after being invalidated by another core
+    if (ca_tag_active_q && miss_rtrn_vld_i &&
+        (address_tag_q == ca_tagged_addr_q)) begin
+      ca_access_revoked_d = 1'b1;
+    end
+
+    // untagAll — cleared by software
+    // triggered when cread/cwrite fails
+    // and thread retries
+    if (!ca_cread_i && !ca_cwrite_i && ca_access_revoked_q) begin
+      ca_access_revoked_d = 1'b0;
+      ca_tag_active_d     = 1'b0;
+    end
+  end
+
+  assign ca_access_revoked_o = ca_access_revoked_q;
+  assign ca_tag_set_o        = ca_tag_active_q;
   assign miss_id_o = RdTxId;
   assign rd_req_d = rd_req_o;
   assign rd_ack_d = rd_ack_i;
@@ -264,6 +312,10 @@ module wt_dcache_ctrl
       data_size_q   <= '0;
       rd_req_q      <= '0;
       rd_ack_q      <= '0;
+      // CA reset
+      ca_access_revoked_q <= '0;
+      ca_tag_active_q     <= '0;
+      ca_tagged_addr_q    <= '0;
     end else begin
       state_q       <= state_d;
       address_tag_q <= address_tag_d;
@@ -274,6 +326,10 @@ module wt_dcache_ctrl
       data_size_q   <= data_size_d;
       rd_req_q      <= rd_req_d;
       rd_ack_q      <= rd_ack_d;
+      // CA update
+      ca_access_revoked_q <= ca_access_revoked_d;
+      ca_tag_active_q     <= ca_tag_active_d;
+      ca_tagged_addr_q    <= ca_tagged_addr_d;
     end
   end
 
