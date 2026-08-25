@@ -397,6 +397,58 @@ module decoder
                   7'b011_0101: instruction_o.op = ariane_pkg::HSV_W;
                   7'b011_0110: instruction_o.op = ariane_pkg::HLV_D;
                   7'b011_0111: instruction_o.op = ariane_pkg::HSV_D;
+
+                  // --------------------------------
+                  // Conditional Access Instructions
+                  // --------------------------------
+                  riscv::OpcodeCustom0: begin
+                    instruction_o.rs1 = instr.itype.rs1;
+                    instruction_o.rd  = instr.itype.rd;
+                    unique case (instr.itype.funct3)
+                      // cread rd, rs1
+                      // Read memory at address rs1
+                      // Tag the cache line for monitoring
+                      // Fails if accessRevokedBit is set
+                      3'b000: begin
+                        instruction_o.fu  = LOAD;
+                        instruction_o.op  = ariane_pkg::CREAD;
+                        imm_select        = IIMM;
+                      end
+                      // cwrite rs1, rs2
+                      // Write to memory at address rs1
+                      // Only if tagged and not revoked
+                      3'b001: begin
+                        instruction_o.fu  = STORE;
+                        instruction_o.op  = ariane_pkg::CWRITE;
+                        instruction_o.rs2 = instr.stype.rs2;
+                        imm_select        = SIMM;
+                      end
+                      default: illegal_instr = 1'b1;
+                    endcase
+                  end
+
+                  riscv::OpcodeCustom1: begin
+                    instruction_o.rs1 = instr.itype.rs1;
+                    unique case (instr.itype.funct3)
+                      // untagOne rs1
+                      // Remove address rs1 from tagSet
+                      // Stop monitoring that location
+                      3'b000: begin
+                        instruction_o.fu = LOAD;
+                        instruction_o.op = ariane_pkg::UNTAG_ONE;
+                      end
+                      // untagAll
+                      // Clear entire tagSet
+                      // Clear accessRevokedBit
+                      // Called after cread/cwrite fails
+                      3'b001: begin
+                        instruction_o.fu = LOAD;
+                        instruction_o.op = ariane_pkg::UNTAG_ALL;
+                      end
+                      default: illegal_instr = 1'b1;
+                    endcase
+                  end
+
                   default: illegal_instr = 1'b1;
 
                 endcase

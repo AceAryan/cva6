@@ -342,6 +342,11 @@ package ariane_pkg;
     HLV_WU,
     HLV_D,
     HSV_D,
+    // Conditional Access Operations
+    CREAD,        // conditional read — tag and load
+    CWRITE,       // conditional write — store if not revoked
+    UNTAG_ONE,    // remove one address from tagSet
+    UNTAG_ALL,    // clear all tags and accessRevokedBit
     // Atomic Memory Operations
     AMO_LRW,
     AMO_LRD,
