@@ -125,6 +125,14 @@ module wt_dcache
   // wbuffer <-> memory
   wbuffer_t [     CVA6Cfg.WtDcacheWbufDepth-1:0]                                  wbuffer_data;
 
+  // CA signals
+  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_ca_tag_bits;
+  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_ca_tag_bits;
+  logic                                 ca_cread;
+  logic                                 ca_cwrite;
+  logic                                 ca_untag_all;
+  logic                                 ca_access_revoked;
+  logic                                 ca_tag_set;
 
   ///////////////////////////////////////////////////////
   // miss handling unit
@@ -233,23 +241,30 @@ module wt_dcache
           .rd_data_i      (rd_data),
           .rd_user_i      (rd_user),
           .rd_vld_bits_i  (rd_vld_bits),
-          .rd_hit_oh_i    (rd_hit_oh)
+          .rd_hit_oh_i    (rd_hit_oh),
+          // CA ports — only connected for load port (k==1)
+          .ca_cread_i          (ca_cread),
+          .ca_cwrite_i         (ca_cwrite),
+          .ca_untag_all_i      (ca_untag_all),
+          .rd_ca_tag_bits_i    (rd_ca_tag_bits),
+          .ca_access_revoked_o (ca_access_revoked),
+          .ca_tag_set_o        (ca_tag_set)
       );
     end else begin
       assign rd_prio[k] = 1'b0;
       assign req_ports_o[k] = '0;
       assign miss_req[k] = 1'b0;
       assign miss_we[k] = 1'b0;
-      assign miss_wdata[k] = {{CVA6Cfg.XLEN} {1'b0}};
-      assign miss_wuser[k] = {{CVA6Cfg.DCACHE_USER_WIDTH} {1'b0}};
-      assign miss_vld_bits_o[k] = {{CVA6Cfg.DCACHE_SET_ASSOC} {1'b0}};
-      assign miss_paddr[k] = {{CVA6Cfg.PLEN} {1'b0}};
+      assign miss_wdata[k] = {{CVA6Cfg.XLEN}{1'b0}};
+      assign miss_wuser[k] = {{CVA6Cfg.DCACHE_USER_WIDTH}{1'b0}};
+      assign miss_vld_bits_o[k] = {{CVA6Cfg.DCACHE_SET_ASSOC}{1'b0}};
+      assign miss_paddr[k] = {{CVA6Cfg.PLEN}{1'b0}};
       assign miss_nc[k] = 1'b0;
       assign miss_size[k] = 3'b0;
-      assign miss_id[k] = {{CVA6Cfg.MEM_TID_WIDTH} {1'b0}};
-      assign rd_tag[k] = {{CVA6Cfg.DCACHE_TAG_WIDTH} {1'b0}};
-      assign rd_idx[k] = {{DCACHE_CL_IDX_WIDTH} {1'b0}};
-      assign rd_off[k] = {{CVA6Cfg.DCACHE_OFFSET_WIDTH} {1'b0}};
+      assign miss_id[k] = {{CVA6Cfg.MEM_TID_WIDTH}{1'b0}};
+      assign rd_tag[k] = {{CVA6Cfg.DCACHE_TAG_WIDTH}{1'b0}};
+      assign rd_idx[k] = {{DCACHE_CL_IDX_WIDTH}{1'b0}};
+      assign rd_off[k] = {{CVA6Cfg.DCACHE_OFFSET_WIDTH}{1'b0}};
       assign rd_req[k] = 1'b0;
       assign rd_tag_only[k] = 1'b0;
     end
@@ -363,7 +378,10 @@ module wt_dcache
       .wr_user_i      (wr_user),
       .wr_data_be_i   (wr_data_be),
       // write buffer forwarding
-      .wbuffer_data_i (wbuffer_data)
+      .wbuffer_data_i (wbuffer_data),
+      // CA ports
+      .rd_ca_tag_bits_o(rd_ca_tag_bits),
+      .wr_ca_tag_bits_i(wr_ca_tag_bits)
   );
 
   ///////////////////////////////////////////////////////

@@ -86,6 +86,11 @@ module load_unit
     input logic sdtrig_load_stall_i,
     input logic sdtrig_load_cancel_i,
     input logic [CVA6Cfg.XLEN-1:0] sdtrig_load_action_i
+
+    // CA outputs
+    output logic ca_cread_o,
+    output logic ca_untag_all_o,
+    output logic ca_access_revoked_i
 );
   enum logic [3:0] {
     IDLE,
@@ -197,6 +202,13 @@ module load_unit
       end
     end
   end
+
+  // ------------------------------------------------
+  // Conditional Access signal detection
+  // Detect CA operations from operation field
+  // ------------------------------------------------
+  assign ca_cread_o    = (lsu_ctrl_i.operation == ariane_pkg::CREAD) && valid_i;
+  assign ca_untag_all_o = (lsu_ctrl_i.operation == ariane_pkg::UNTAG_ALL) && valid_i;
 
   // page offset is defined as the lower 12 bits, feed through for address checker
   assign page_offset_o = lsu_ctrl_i.vaddr[11:0];

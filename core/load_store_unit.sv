@@ -516,6 +516,12 @@ module load_store_unit
   end
 
   logic store_buffer_empty;
+
+  // CA signals from load unit to cache
+  logic ca_cread_lsu;
+  logic ca_untag_all_lsu;
+  logic ca_access_revoked_lsu;
+  
   // ------------------
   // Store Unit
   // ------------------
@@ -615,6 +621,10 @@ module load_store_unit
       .sdtrig_load_stall_i  (sdtrig_load_stall_i),
       .sdtrig_load_cancel_i (sdtrig_load_cancel_i),
       .sdtrig_load_action_i (sdtrig_load_action_i)
+      // CA
+      .ca_cread_o           (ca_cread_lsu),
+      .ca_untag_all_o       (ca_untag_all_lsu),
+      .ca_access_revoked_i  (ca_access_revoked_lsu)
   );
 
   // ----------------------------
