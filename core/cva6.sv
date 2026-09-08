@@ -215,6 +215,8 @@ module cva6
       logic                                  kill_req;
       logic                                  tag_valid;
       cbo_t                                  cbo_op;
+      // CA operation type
+      wt_cache_pkg::ca_op_t                  ca_op;
     },
 
     localparam type dcache_req_o_t = struct packed {

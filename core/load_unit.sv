@@ -221,7 +221,16 @@ module load_unit
   // this is a read-only interface so set the write enable to 0
   assign req_port_o.data_we = 1'b0;
   assign req_port_o.data_wdata = '0;
-  assign req_port_o.cbo_op = ariane_pkg::CBO_NONE;
+  assign req_port_o.cbo_op = 
+  // CA operation type — passed to cache controller
+  assign req_port_o.ca_op = (lsu_ctrl_i.operation == ariane_pkg::CREAD)    ?
+                              wt_cache_pkg::CA_CREAD  :
+                            (lsu_ctrl_i.operation == ariane_pkg::CWRITE)   ?
+                              wt_cache_pkg::CA_CWRITE :
+                            (lsu_ctrl_i.operation == ariane_pkg::UNTAG_ONE ||
+                             lsu_ctrl_i.operation == ariane_pkg::UNTAG_ALL) ?
+                              wt_cache_pkg::CA_UNTAG  :
+                              wt_cache_pkg::CA_NONE;
   // compose the load buffer write data, control is handled in the FSM
   assign ldbuf_wdata = {
     lsu_ctrl_i.trans_id, lsu_ctrl_i.vaddr[CVA6Cfg.XLEN_ALIGN_BYTES-1:0], lsu_ctrl_i.operation

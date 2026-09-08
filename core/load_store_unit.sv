@@ -517,6 +517,19 @@ module load_store_unit
 
   logic store_buffer_empty;
 
+  // CA operation detection
+  wt_cache_pkg::ca_op_t ca_op;
+  always_comb begin
+    ca_op = wt_cache_pkg::CA_NONE;
+    case (fu_data_i.operation)
+      ariane_pkg::CREAD:    ca_op = wt_cache_pkg::CA_CREAD;
+      ariane_pkg::CWRITE:   ca_op = wt_cache_pkg::CA_CWRITE;
+      ariane_pkg::UNTAG_ONE: ca_op = wt_cache_pkg::CA_UNTAG;
+      ariane_pkg::UNTAG_ALL: ca_op = wt_cache_pkg::CA_UNTAG;
+      default:              ca_op = wt_cache_pkg::CA_NONE;
+    endcase
+  end
+
   // CA signals from load unit to cache
   logic ca_cread_lsu;
   logic ca_untag_all_lsu;

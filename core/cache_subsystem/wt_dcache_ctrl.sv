@@ -58,6 +58,7 @@ module wt_dcache_ctrl
     // CA ports
     input logic ca_cread_i,
     input logic ca_cwrite_i,
+    input logic ca_untag_all_i,
     input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_ca_tag_bits_i,
     output logic ca_access_revoked_o,
     output logic ca_tag_set_o
@@ -149,12 +150,12 @@ module wt_dcache_ctrl
       ca_access_revoked_d = 1'b1;
     end
 
-    // untagAll — cleared by software
-    // triggered when cread/cwrite fails
-    // and thread retries
-    if (!ca_cread_i && !ca_cwrite_i && ca_access_revoked_q) begin
+    // untagAll — explicitly called by software
+    // clears tagSet and accessRevokedBit
+    if (ca_untag_all_i) begin
       ca_access_revoked_d = 1'b0;
       ca_tag_active_d     = 1'b0;
+      ca_tagged_addr_d    = '0;
     end
   end
 
