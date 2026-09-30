@@ -47,6 +47,7 @@ module store_buffer
     input logic [(CVA6Cfg.XLEN/8)-1:0] be_i,  // byte enable in
     input logic [1:0] data_size_i,  // type of request we are making (e.g.: bytes to write)
     input cbo_t cbo_op_i,  // type of cache block operation
+    input wt_cache_pkg::ca_op_t ca_op_i,
 
     // D$ interface
     input  dcache_req_o_t req_port_i,
@@ -62,6 +63,7 @@ module store_buffer
     logic [(CVA6Cfg.XLEN/8)-1:0] be;
     logic [1:0] data_size;
     cbo_t cbo_op;
+    wt_cache_pkg::ca_op_t ca_op;
     logic valid;  // this entry is valid, we need this for checking if the address offset matches
     logic wait_rvalid;  // need to wait for rvalid...
   }
@@ -101,6 +103,7 @@ module store_buffer
       speculative_queue_n[speculative_write_pointer_q].data_size = data_size_i;
       speculative_queue_n[speculative_write_pointer_q].valid = 1'b1;
       speculative_queue_n[speculative_write_pointer_q].cbo_op = cbo_op_i;
+      speculative_queue_n[speculative_write_pointer_q].ca_op = ca_op_i;
       speculative_queue_n[speculative_write_pointer_q].wait_rvalid = 1'b0;
       // advance the write pointer
       speculative_write_pointer_n = speculative_write_pointer_q + 1'b1;
@@ -155,6 +158,7 @@ module store_buffer
   assign req_port_o.data_wuser = '0;
   assign req_port_o.data_be = commit_queue_q[commit_read_pointer_q].be;
   assign req_port_o.data_size = commit_queue_q[commit_read_pointer_q].data_size;
+  assign req_port_o.ca_op = commit_queue_q[commit_read_pointer_q].ca_op;
 
   assign rvfi_mem_paddr_o = speculative_queue_q[speculative_read_pointer_q].address;
 
@@ -315,6 +319,5 @@ module store_buffer
   else $error("[Commit Queue] You are trying to commit a store although the buffer is full");
   //pragma translate_on
 endmodule
-
 
 

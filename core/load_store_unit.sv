@@ -384,6 +384,7 @@ module load_store_unit
     assign dcache_req_ports_o[0].data_size     = 2'b11;
     assign dcache_req_ports_o[0].data_we       = 1'b0;
     assign dcache_req_ports_o[0].data_wuser    = '0;
+    assign dcache_req_ports_o[0].ca_op         = wt_cache_pkg::CA_NONE;
     assign dcache_req_ports_o[0].kill_req      = '0;
     assign dcache_req_ports_o[0].tag_valid     = 1'b0;
 
@@ -530,23 +531,26 @@ module load_store_unit
 
   logic store_buffer_empty;
 
-  // CA operation detection
+  // Translate decoded LSU operations into the compact CA operation encoding.
   wt_cache_pkg::ca_op_t ca_op;
   always_comb begin
     ca_op = wt_cache_pkg::CA_NONE;
     case (fu_data_i.operation)
       ariane_pkg::CREAD:    ca_op = wt_cache_pkg::CA_CREAD;
       ariane_pkg::CWRITE:   ca_op = wt_cache_pkg::CA_CWRITE;
-      ariane_pkg::UNTAG_ONE: ca_op = wt_cache_pkg::CA_UNTAG;
-      ariane_pkg::UNTAG_ALL: ca_op = wt_cache_pkg::CA_UNTAG;
+      ariane_pkg::UNTAG_ONE: ca_op = wt_cache_pkg::CA_UNTAG_ONE;
+      ariane_pkg::UNTAG_ALL: ca_op = wt_cache_pkg::CA_UNTAG_ALL;
       default:              ca_op = wt_cache_pkg::CA_NONE;
     endcase
   end
 
-  // CA signals from load unit to cache
+  // CA qualifiers and status at the load-unit/cache boundary.
   logic ca_cread_lsu;
   logic ca_untag_all_lsu;
   logic ca_access_revoked_lsu;
+
+  // The cache returns the sticky revocation state with each load response.
+  assign ca_access_revoked_lsu = dcache_req_ports_i[1].ca_access_revoked;
   
   // ------------------
   // Store Unit
@@ -646,8 +650,8 @@ module load_store_unit
       //sdtrig
       .sdtrig_load_stall_i  (sdtrig_load_stall_i),
       .sdtrig_load_cancel_i (sdtrig_load_cancel_i),
-      .sdtrig_load_action_i (sdtrig_load_action_i)
-      // CA
+      .sdtrig_load_action_i (sdtrig_load_action_i),
+      // Forward CA qualifiers with the load-unit request interface.
       .ca_cread_o           (ca_cread_lsu),
       .ca_untag_all_o       (ca_untag_all_lsu),
       .ca_access_revoked_i  (ca_access_revoked_lsu)

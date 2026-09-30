@@ -216,7 +216,7 @@ module cva6
       logic                                  kill_req;
       logic                                  tag_valid;
       cbo_t                                  cbo_op;
-      // CA operation type
+      // Sideband classification distinguishes CA requests from normal accesses.
       wt_cache_pkg::ca_op_t                  ca_op;
     },
 
@@ -226,7 +226,7 @@ module cva6
       logic [CVA6Cfg.DcacheIdWidth-1:0]     data_rid;
       logic [CVA6Cfg.XLEN-1:0]              data_rdata;
       logic [CVA6Cfg.DCACHE_USER_WIDTH-1:0] data_ruser;
-      logic                                 data_error;
+      logic                                 ca_access_revoked;
     },
 
     // Accelerator - CVA6

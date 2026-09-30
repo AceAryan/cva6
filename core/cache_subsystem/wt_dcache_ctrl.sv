@@ -58,7 +58,9 @@ module wt_dcache_ctrl
     // CA ports
     input logic ca_cread_i,
     input logic ca_cwrite_i,
+    input logic ca_untag_one_i,
     input logic ca_untag_all_i,
+    input logic [CVA6Cfg.PLEN-1:0] ca_untag_addr_i,
     input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_ca_tag_bits_i,
     output logic ca_access_revoked_o,
     output logic ca_tag_set_o
@@ -83,10 +85,16 @@ module wt_dcache_ctrl
   logic [CVA6Cfg.DcacheIdWidth-1:0] id_d, id_q;
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] vld_data_d, vld_data_q;
   logic save_tag, rd_req_d, rd_req_q, rd_ack_d, rd_ack_q;
-   // CA state registers
+  localparam int unsigned CA_TAGSET_DEPTH = 8;
+  localparam int unsigned CA_TAGSET_IDX_WIDTH = $clog2(CA_TAGSET_DEPTH);
+
+  // The tag set stores complete cache-line addresses, allowing untagOne and
+  // invalidation detection to distinguish equal tags in different indices.
   logic ca_access_revoked_d, ca_access_revoked_q;
-  logic ca_tag_active_d,     ca_tag_active_q;
-  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_tagged_addr_d, ca_tagged_addr_q;
+  logic [CA_TAGSET_DEPTH-1:0] ca_tag_active_d, ca_tag_active_q;
+  logic [CVA6Cfg.PLEN-1:0] ca_tagged_addr_d[CA_TAGSET_DEPTH];
+  logic [CVA6Cfg.PLEN-1:0] ca_tagged_addr_q[CA_TAGSET_DEPTH];
+  logic [CA_TAGSET_IDX_WIDTH-1:0] ca_tag_rr_d, ca_tag_rr_q;
   logic [1:0] data_size_d, data_size_q;
 
   ///////////////////////////////////////////////////////
@@ -124,43 +132,76 @@ module wt_dcache_ctrl
   assign miss_wdata_o = '0;
   assign miss_wuser_o = '0;
 
-  // ------------------------------------------------
-  // CA Logic
-  // accessRevokedBit set when:
-  // 1. This core tagged a line (ca_cread)
-  // 2. Another core invalidated that line
-  //    detected via miss_rtrn_vld_i on tagged addr
-  // ------------------------------------------------
+  // The revoked flag is sticky until software explicitly issues untagAll.
   always_comb begin
     ca_access_revoked_d = ca_access_revoked_q;
     ca_tag_active_d     = ca_tag_active_q;
-    ca_tagged_addr_d    = ca_tagged_addr_q;
+    ca_tag_rr_d         = ca_tag_rr_q;
+    for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
+      ca_tagged_addr_d[i] = ca_tagged_addr_q[i];
+    end
 
-    // cread — tag the address
+    // Capture only an accepted cread. Duplicate tags do not consume another slot.
     if (ca_cread_i && req_port_o.data_gnt) begin
-      ca_tag_active_d  = 1'b1;
-      ca_tagged_addr_d = address_tag_d;
+      logic duplicate;
+      logic slot_found;
+      logic [CA_TAGSET_IDX_WIDTH-1:0] slot;
+      duplicate = 1'b0;
+      slot_found = 1'b0;
+      slot = ca_tag_rr_q;
+      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
+        if (ca_tag_active_q[i] &&
+            (ca_tagged_addr_q[i] == {address_tag_d, address_idx_d,
+                                      {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}})) begin
+          duplicate = 1'b1;
+        end
+        if (!slot_found && !ca_tag_active_q[i]) begin
+          slot = CA_TAGSET_IDX_WIDTH'(i);
+          slot_found = 1'b1;
+        end
+      end
+      if (!duplicate) begin
+        ca_tag_active_d[slot] = 1'b1;
+        ca_tagged_addr_d[slot] = {address_tag_d, address_idx_d,
+                                   {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}};
+        ca_tag_rr_d = (slot == CA_TAGSET_DEPTH - 1) ? '0 : slot + 1'b1;
+      end
     end
 
-    // Invalidation detected on tagged line
-    // miss_rtrn_vld_i means line was fetched
-    // after being invalidated by another core
-    if (ca_tag_active_q && miss_rtrn_vld_i &&
-        (address_tag_q == ca_tagged_addr_q)) begin
-      ca_access_revoked_d = 1'b1;
+    // A returning miss for any tagged line means another agent invalidated it.
+    if (miss_rtrn_vld_i) begin
+      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
+        if (ca_tag_active_q[i] &&
+            (ca_tagged_addr_q[i] == {address_tag_q, address_idx_q,
+                                      {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}})) begin
+          ca_access_revoked_d = 1'b1;
+        end
+      end
     end
 
-    // untagAll — explicitly called by software
-    // clears tagSet and accessRevokedBit
+    // untagOne removes only the matching cache-line address.
+    if (ca_untag_one_i) begin
+      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
+        if (ca_tag_active_q[i] && (ca_tagged_addr_q[i] == ca_untag_addr_i)) begin
+          ca_tag_active_d[i] = 1'b0;
+        end
+      end
+    end
+
+    // untagAll is the explicit cleanup point for all CA state.
     if (ca_untag_all_i) begin
       ca_access_revoked_d = 1'b0;
-      ca_tag_active_d     = 1'b0;
-      ca_tagged_addr_d    = '0;
+      ca_tag_active_d     = '0;
+      ca_tag_rr_d         = '0;
+      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
+        ca_tagged_addr_d[i] = '0;
+      end
     end
   end
 
   assign ca_access_revoked_o = ca_access_revoked_q;
-  assign ca_tag_set_o        = ca_tag_active_q;
+  assign ca_tag_set_o        = |ca_tag_active_q;
+  assign req_port_o.ca_access_revoked = ca_access_revoked_q;
   assign miss_id_o = RdTxId;
   assign rd_req_d = rd_req_o;
   assign rd_ack_d = rd_ack_i;
@@ -313,10 +354,13 @@ module wt_dcache_ctrl
       data_size_q   <= '0;
       rd_req_q      <= '0;
       rd_ack_q      <= '0;
-      // CA reset
+      // Reset the bounded tag set and its replacement cursor with the cache controller.
       ca_access_revoked_q <= '0;
       ca_tag_active_q     <= '0;
-      ca_tagged_addr_q    <= '0;
+      ca_tag_rr_q         <= '0;
+      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
+        ca_tagged_addr_q[i] <= '0;
+      end
     end else begin
       state_q       <= state_d;
       address_tag_q <= address_tag_d;
@@ -327,10 +371,13 @@ module wt_dcache_ctrl
       data_size_q   <= data_size_d;
       rd_req_q      <= rd_req_d;
       rd_ack_q      <= rd_ack_d;
-      // CA update
+      // Commit the next-cycle CA state alongside the controller state.
       ca_access_revoked_q <= ca_access_revoked_d;
       ca_tag_active_q     <= ca_tag_active_d;
-      ca_tagged_addr_q    <= ca_tagged_addr_d;
+      ca_tag_rr_q         <= ca_tag_rr_d;
+      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
+        ca_tagged_addr_q[i] <= ca_tagged_addr_d[i];
+      end
     end
   end
 

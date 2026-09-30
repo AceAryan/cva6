@@ -68,6 +68,7 @@ module zcmt_decoder #(
     // cache request port
     req_port_o.data_wdata = '0;
     req_port_o.data_wuser = '0;
+    req_port_o.ca_op      = wt_cache_pkg::CA_NONE;
     req_port_o.data_req   = 1'b0;
     req_port_o.data_we    = 1'b0;
     req_port_o.data_be    = '0;

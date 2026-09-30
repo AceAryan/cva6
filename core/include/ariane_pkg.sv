@@ -342,7 +342,7 @@ package ariane_pkg;
     HLV_WU,
     HLV_D,
     HSV_D,
-    // Conditional Access Operations
+    // Conditional Access operations decoded from the custom opcode space.
     CREAD,        // conditional read — tag and load
     CWRITE,       // conditional write — store if not revoked
     UNTAG_ONE,    // remove one address from tagSet

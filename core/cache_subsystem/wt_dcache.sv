@@ -125,14 +125,15 @@ module wt_dcache
   // wbuffer <-> memory
   wbuffer_t [     CVA6Cfg.WtDcacheWbufDepth-1:0]                                  wbuffer_data;
 
-  // CA signals
+  // Per-way markers accompany tag-SRAM data; scalar signals classify CA requests
+  // and expose controller state to the surrounding request path.
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_ca_tag_bits;
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_ca_tag_bits;
-  logic                                 ca_cread;
-  logic                                 ca_cwrite;
-  logic                                 ca_untag_all;
   logic                                 ca_access_revoked;
   logic                                 ca_tag_set;
+
+  // CA request classification is carried in each normal cache request.
+  assign wr_ca_tag_bits = '0;
 
   ///////////////////////////////////////////////////////
   // miss handling unit
@@ -242,10 +243,14 @@ module wt_dcache
           .rd_user_i      (rd_user),
           .rd_vld_bits_i  (rd_vld_bits),
           .rd_hit_oh_i    (rd_hit_oh),
-          // CA ports — only connected for load port (k==1)
-          .ca_cread_i          (ca_cread),
-          .ca_cwrite_i         (ca_cwrite),
-          .ca_untag_all_i      (ca_untag_all),
+          // The CA interface is attached to the load-side controller instance.
+          .ca_cread_i          (req_ports_i[k].ca_op == wt_cache_pkg::CA_CREAD),
+          .ca_cwrite_i         (req_ports_i[k].ca_op == wt_cache_pkg::CA_CWRITE),
+          .ca_untag_one_i      (req_ports_i[k].ca_op == wt_cache_pkg::CA_UNTAG_ONE),
+          .ca_untag_all_i      (req_ports_i[k].ca_op == wt_cache_pkg::CA_UNTAG_ALL),
+          .ca_untag_addr_i     ({req_ports_i[k].address_tag,
+                                 req_ports_i[k].address_index,
+                                 {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}}),
           .rd_ca_tag_bits_i    (rd_ca_tag_bits),
           .ca_access_revoked_o (ca_access_revoked),
           .ca_tag_set_o        (ca_tag_set)
@@ -294,6 +299,7 @@ module wt_dcache
       // request ports from core (store unit)
       .req_port_i     (req_ports_i[NumPorts-1]),
       .req_port_o     (req_ports_o[NumPorts-1]),
+      .ca_access_revoked_i(ca_access_revoked),
       // miss unit interface
       .miss_req_o     (miss_req[NumPorts-1]),
       .miss_ack_i     (miss_ack[NumPorts-1]),
@@ -379,7 +385,7 @@ module wt_dcache
       .wr_data_be_i   (wr_data_be),
       // write buffer forwarding
       .wbuffer_data_i (wbuffer_data),
-      // CA ports
+      // Keep the per-way CA marker on the same SRAM read/write path as tags.
       .rd_ca_tag_bits_o(rd_ca_tag_bits),
       .wr_ca_tag_bits_i(wr_ca_tag_bits)
   );

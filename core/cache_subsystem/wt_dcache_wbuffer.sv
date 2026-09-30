@@ -68,6 +68,7 @@ module wt_dcache_wbuffer
     // core request ports
     input dcache_req_i_t req_port_i,
     output dcache_req_o_t req_port_o,
+    input logic ca_access_revoked_i,
     // interface to miss handler
     input logic miss_ack_i,
     output logic [CVA6Cfg.PLEN-1:0] miss_paddr_o,
@@ -504,6 +505,7 @@ module wt_dcache_wbuffer
   assign req_port_o.data_rdata  = '0;
   assign req_port_o.data_ruser  = '0;
   assign req_port_o.data_rid    = '0;
+  assign req_port_o.ca_access_revoked = ca_access_revoked_i;
 
   assign rd_hit_oh_d = rd_hit_oh_i;
 
@@ -571,13 +573,20 @@ module wt_dcache_wbuffer
     end
 
     // write new word into the buffer
+    // A revoked conditional write is acknowledged without entering the
+    // write buffer, allowing software to observe the failure status.
     if (req_port_i.data_req && rdy) begin
+      if (req_port_i.ca_op == wt_cache_pkg::CA_CWRITE && ca_access_revoked_i) begin
+        // The request is completed without a memory-side write.
+        req_port_o.data_gnt = 1'b1;
+        wbuffer_wren = 1'b0;
+      end else begin
       // in case we have an NI address, need to drain the buffer first
       // in case we are serving an NI address,  we block until it is written to memory
       if (!ni_conflict) begin  //empty of NI operations
         wbuffer_wren = 1'b1;
-
         req_port_o.data_gnt = 1'b1;
+
         ni_pending_d[wr_ptr] = is_ni;
 
         wbuffer_d[wr_ptr].checked = 1'b0;
@@ -594,6 +603,7 @@ module wt_dcache_wbuffer
             wbuffer_d[wr_ptr].data[k*8+:8] = req_port_i.data_wdata[k*8+:8];
             if (CVA6Cfg.DATA_USER_EN) begin
               wbuffer_d[wr_ptr].user[k*8+:8] = req_port_i.data_wuser[k*8+:8];
+            end
             end
           end
         end

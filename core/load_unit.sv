@@ -85,12 +85,12 @@ module load_unit
     //Trigger module
     input logic sdtrig_load_stall_i,
     input logic sdtrig_load_cancel_i,
-    input logic [CVA6Cfg.XLEN-1:0] sdtrig_load_action_i
+    input logic [CVA6Cfg.XLEN-1:0] sdtrig_load_action_i,
 
-    // CA outputs
+    // CA operation qualifiers are asserted only for a valid load-unit request.
     output logic ca_cread_o,
     output logic ca_untag_all_o,
-    output logic ca_access_revoked_i
+    input logic ca_access_revoked_i
 );
   enum logic [3:0] {
     IDLE,
@@ -203,10 +203,8 @@ module load_unit
     end
   end
 
-  // ------------------------------------------------
-  // Conditional Access signal detection
-  // Detect CA operations from operation field
-  // ------------------------------------------------
+  // Qualify instruction decoding with valid_i so idle/stale operation fields
+  // cannot issue CA controls.
   assign ca_cread_o    = (lsu_ctrl_i.operation == ariane_pkg::CREAD) && valid_i;
   assign ca_untag_all_o = (lsu_ctrl_i.operation == ariane_pkg::UNTAG_ALL) && valid_i;
 
@@ -221,15 +219,16 @@ module load_unit
   // this is a read-only interface so set the write enable to 0
   assign req_port_o.data_we = 1'b0;
   assign req_port_o.data_wdata = '0;
-  assign req_port_o.cbo_op = 
-  // CA operation type — passed to cache controller
+  assign req_port_o.cbo_op = ariane_pkg::CBO_NONE;
+  // Carry CA intent with the request; non-CA operations explicitly use CA_NONE.
   assign req_port_o.ca_op = (lsu_ctrl_i.operation == ariane_pkg::CREAD)    ?
                               wt_cache_pkg::CA_CREAD  :
                             (lsu_ctrl_i.operation == ariane_pkg::CWRITE)   ?
                               wt_cache_pkg::CA_CWRITE :
-                            (lsu_ctrl_i.operation == ariane_pkg::UNTAG_ONE ||
-                             lsu_ctrl_i.operation == ariane_pkg::UNTAG_ALL) ?
-                              wt_cache_pkg::CA_UNTAG  :
+                            (lsu_ctrl_i.operation == ariane_pkg::UNTAG_ONE) ?
+                              wt_cache_pkg::CA_UNTAG_ONE :
+                            (lsu_ctrl_i.operation == ariane_pkg::UNTAG_ALL) ?
+                              wt_cache_pkg::CA_UNTAG_ALL :
                               wt_cache_pkg::CA_NONE;
   // compose the load buffer write data, control is handled in the FSM
   assign ldbuf_wdata = {lsu_ctrl_i.trans_id, lsu_ctrl_i.vaddr, lsu_ctrl_i.operation};
@@ -630,6 +629,11 @@ module load_unit
           endian_data[CVA6Cfg.XLEN-1:0] = {<<8{shifted_data[CVA6Cfg.XLEN-1:0]}};
         end
       endcase
+      // CA uses bit 0 as a software-visible failure indicator. The remaining
+      // bits retain the normal load value so successful cread remains useful.
+      if (ldbuf_rdata.operation == ariane_pkg::CREAD) begin
+        result_o[0] = ca_access_revoked_i;
+      end
     end
   end
 

@@ -96,19 +96,21 @@ package wt_cache_pkg;
   //  Memory Reclamation in Optimistic Data Structures"
   // ------------------------------------------------
 
-  // Per core CA state
-  // accessRevokedBit: set when tagged line invalidated
+  // Packed representation of per-core CA status. The revoked bit is sticky
+  // until cleanup; ca_enabled indicates whether CA behavior is enabled.
   typedef struct packed {
     logic access_revoked_bit;  // 1 = tagged line was invalidated
     logic ca_enabled;          // 1 = CA mode active for this core
   } ca_state_t;
 
-  // CA instruction type
-  typedef enum logic [1:0] {
-    CA_NONE     = 2'b00,  // normal access
-    CA_CREAD    = 2'b01,  // conditional read
-    CA_CWRITE   = 2'b10,  // conditional write
-    CA_UNTAG    = 2'b11   // untagOne or untagAll
+  // Compact request-side classification used to carry CA intent through the
+  // data-cache request interface; ordinary accesses use CA_NONE.
+  typedef enum logic [2:0] {
+    CA_NONE      = 3'b000,  // normal access
+    CA_CREAD     = 3'b001,  // conditional read
+    CA_CWRITE    = 3'b010,  // conditional write
+    CA_UNTAG_ONE = 3'b011,  // remove one address from tagSet
+    CA_UNTAG_ALL = 3'b100   // clear the entire tagSet
   } ca_op_t;
 
 endpackage

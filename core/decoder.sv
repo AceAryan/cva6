@@ -401,6 +401,8 @@ module decoder
                   // --------------------------------
                   // Conditional Access Instructions
                   // --------------------------------
+                  // Custom opcode/funct3 pairs identify CA operations; other
+                  // funct3 values remain illegal rather than aliasing an op.
                   riscv::OpcodeCustom0: begin
                     instruction_o.rs1 = instr.itype.rs1;
                     instruction_o.rd  = instr.itype.rd;

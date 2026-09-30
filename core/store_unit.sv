@@ -119,8 +119,11 @@ module store_unit
     return data_tmp[CVA6Cfg.XLEN-1:0];
   endfunction
 
-  // it doesn't matter what we are writing back as stores don't return anything
-  assign result_o = lsu_ctrl_i.data;
+  // Stores normally have no architectural result. For cwrite, preserve the
+  // operation's data while exposing the cache revocation status in bit 0.
+  assign result_o = (lsu_ctrl_i.operation == ariane_pkg::CWRITE) ?
+      {lsu_ctrl_i.data[CVA6Cfg.XLEN-1:1], req_port_i.ca_access_revoked} :
+      lsu_ctrl_i.data;
 
   enum logic [1:0] {
     IDLE,
@@ -142,6 +145,7 @@ module store_unit
   logic [1:0] st_data_size_n, st_data_size_q;
   amo_t amo_op_d, amo_op_q;
   cbo_t cbo_op_d, cbo_op_q;
+  wt_cache_pkg::ca_op_t ca_op_d, ca_op_q;
 
   logic [CVA6Cfg.TRANS_ID_BITS-1:0] trans_id_n, trans_id_q;
 
@@ -326,6 +330,9 @@ module store_unit
     end else begin
       cbo_op_d = ariane_pkg::CBO_NONE;
     end
+
+    ca_op_d = (lsu_ctrl_i.operation == ariane_pkg::CWRITE) ?
+        wt_cache_pkg::CA_CWRITE : wt_cache_pkg::CA_NONE;
   end
 
   logic store_buffer_valid, amo_buffer_valid;
@@ -368,6 +375,7 @@ module store_unit
       .rvfi_mem_paddr_o     (rvfi_mem_paddr_o),
       .data_i               (st_data_q),
       .cbo_op_i             (cbo_op_q),
+      .ca_op_i              (ca_op_q),
       .be_i                 (st_be_q),
       .data_size_i          (st_data_size_q),
       .req_port_i           (req_port_i),
@@ -409,6 +417,7 @@ module store_unit
       trans_id_q     <= '0;
       amo_op_q       <= AMO_NONE;
       cbo_op_q       <= ariane_pkg::CBO_NONE;
+      ca_op_q        <= wt_cache_pkg::CA_NONE;
     end else begin
       state_q        <= state_d;
       st_be_q        <= st_be_n;
@@ -417,6 +426,7 @@ module store_unit
       st_data_size_q <= st_data_size_n;
       amo_op_q       <= amo_op_d;
       cbo_op_q       <= cbo_op_d;
+      ca_op_q        <= ca_op_d;
     end
   end
 
