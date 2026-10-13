@@ -227,6 +227,7 @@ module cva6
       logic [CVA6Cfg.XLEN-1:0]              data_rdata;
       logic [CVA6Cfg.DCACHE_USER_WIDTH-1:0] data_ruser;
       logic                                 ca_access_revoked;
+      logic data_error;
     },
 
     // Accelerator - CVA6

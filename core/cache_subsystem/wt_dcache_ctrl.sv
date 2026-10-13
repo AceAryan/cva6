@@ -202,6 +202,7 @@ module wt_dcache_ctrl
   assign ca_access_revoked_o = ca_access_revoked_q;
   assign ca_tag_set_o        = |ca_tag_active_q;
   assign req_port_o.ca_access_revoked = ca_access_revoked_q;
+  assign req_port_o.data_error = 1'b0;
   assign miss_id_o = RdTxId;
   assign rd_req_d = rd_req_o;
   assign rd_ack_d = rd_ack_i;
