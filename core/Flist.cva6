@@ -183,6 +183,7 @@ ${CVA6_REPO_DIR}/core/frontend/instr_queue.sv
 ${CVA6_REPO_DIR}/core/frontend/frontend.sv
 
 // Cache subsystem
+${CVA6_REPO_DIR}/core/cache_subsystem/wt_dcache_ca_tag_cmp.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/wt_dcache_ctrl.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/wt_dcache_mem.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/wt_dcache_missunit.sv

@@ -48,10 +48,6 @@ module wt_dcache_mem
     output logic [NumPorts-1:0] rd_ack_o,
     output logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_vld_bits_o,
     output logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_hit_oh_o,
-    // CA: tag bit output per way
-    output logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_ca_tag_bits_o,
-    // CA: tag bit write input
-    input  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_ca_tag_bits_i,
     output logic [CVA6Cfg.XLEN-1:0] rd_data_o,
     output logic [CVA6Cfg.DCACHE_USER_WIDTH-1:0] rd_user_o,
 
@@ -118,7 +114,7 @@ module wt_dcache_mem
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] vld_req;  // bit enable for valid regs
   logic vld_we;  // valid bits write enable
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] vld_wdata;  // valid bits to write
-  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_TAG_WIDTH-1:0]            tag_rdata;                    // these are the tags coming from the tagmem
+  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_TAG_WIDTH-1:0] tag_rdata;  // tags from the tag SRAM
   logic [DCACHE_CL_IDX_WIDTH-1:0] vld_addr;  // valid bit
 
   logic [$clog2(NumPorts)-1:0] vld_sel_d, vld_sel_q;
@@ -305,9 +301,8 @@ module wt_dcache_mem
   // memory arrays and regs
   ///////////////////////////////////////////////////////
 
-  // Each way stores one packed tag entry: [CA marker | valid | address tag].
-  // Keeping the CA marker beside the valid/tag bits ties it to the same set entry.
-  logic [CVA6Cfg.DCACHE_TAG_WIDTH+1:0] vld_tag_rdata[CVA6Cfg.DCACHE_SET_ASSOC-1:0];
+  // Each way stores one packed tag entry: [valid | address tag].
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH:0] vld_tag_rdata[CVA6Cfg.DCACHE_SET_ASSOC-1:0];
 
   for (genvar k = 0; k < DCACHE_NUM_BANKS; k++) begin : gen_data_banks
     // Data RAM
@@ -336,13 +331,11 @@ module wt_dcache_mem
 
     assign tag_rdata[i]     = vld_tag_rdata[i][CVA6Cfg.DCACHE_TAG_WIDTH-1:0];
     assign rd_vld_bits_o[i] = vld_tag_rdata[i][CVA6Cfg.DCACHE_TAG_WIDTH];
-    // The CA marker is the MSB of the packed tag SRAM word.
-    assign rd_ca_tag_bits_o[i] = vld_tag_rdata[i][CVA6Cfg.DCACHE_TAG_WIDTH+1];
 
     // Tag RAM
     sram_cache #(
-        // Address tag, valid bit, and one CA marker bit per way.
-        .DATA_WIDTH (CVA6Cfg.DCACHE_TAG_WIDTH + 2),
+        // Address tag and valid bit.
+        .DATA_WIDTH (CVA6Cfg.DCACHE_TAG_WIDTH + 1),
         .BYTE_ACCESS(0),
         .TECHNO_CUT (CVA6Cfg.TechnoCut),
         .NUM_WORDS  (CVA6Cfg.DCACHE_NUM_WORDS)
@@ -353,8 +346,7 @@ module wt_dcache_mem
         .we_i   (vld_we),
         .addr_i (vld_addr),
         .wuser_i('0),
-        // Match the read-side layout: CA marker, valid bit, then address tag.
-        .wdata_i({wr_ca_tag_bits_i[i], vld_wdata[i], wr_cl_tag_i}),
+        .wdata_i({vld_wdata[i], wr_cl_tag_i}),
         .be_i   ('1),
         .ruser_o(),
         .rdata_o(vld_tag_rdata[i])

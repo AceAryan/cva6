@@ -125,15 +125,9 @@ module wt_dcache
   // wbuffer <-> memory
   wbuffer_t [     CVA6Cfg.WtDcacheWbufDepth-1:0]                                  wbuffer_data;
 
-  // Per-way markers accompany tag-SRAM data; scalar signals classify CA requests
-  // and expose controller state to the surrounding request path.
-  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_ca_tag_bits;
-  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_ca_tag_bits;
+  // Scalar signals classify CA requests and expose controller state.
   logic                                 ca_access_revoked;
   logic                                 ca_tag_set;
-
-  // CA request classification is carried in each normal cache request.
-  assign wr_ca_tag_bits = '0;
 
   ///////////////////////////////////////////////////////
   // miss handling unit
@@ -251,7 +245,6 @@ module wt_dcache
           .ca_untag_addr_i     ({req_ports_i[k].address_tag,
                                  req_ports_i[k].address_index,
                                  {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}}),
-          .rd_ca_tag_bits_i    (rd_ca_tag_bits),
           .ca_access_revoked_o (ca_access_revoked),
           .ca_tag_set_o        (ca_tag_set)
       );
@@ -384,10 +377,7 @@ module wt_dcache
       .wr_user_i      (wr_user),
       .wr_data_be_i   (wr_data_be),
       // write buffer forwarding
-      .wbuffer_data_i (wbuffer_data),
-      // Keep the per-way CA marker on the same SRAM read/write path as tags.
-      .rd_ca_tag_bits_o(rd_ca_tag_bits),
-      .wr_ca_tag_bits_i(wr_ca_tag_bits)
+      .wbuffer_data_i (wbuffer_data)
   );
 
   ///////////////////////////////////////////////////////

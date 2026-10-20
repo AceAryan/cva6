@@ -55,13 +55,12 @@ module wt_dcache_ctrl
     input logic [CVA6Cfg.DCACHE_USER_WIDTH-1:0] rd_user_i,
     input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_vld_bits_i,
     input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_hit_oh_i,
-    // CA ports
+    // conditional access ports
     input logic ca_cread_i,
     input logic ca_cwrite_i,
     input logic ca_untag_one_i,
     input logic ca_untag_all_i,
     input logic [CVA6Cfg.PLEN-1:0] ca_untag_addr_i,
-    input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] rd_ca_tag_bits_i,
     output logic ca_access_revoked_o,
     output logic ca_tag_set_o
 );
@@ -87,13 +86,14 @@ module wt_dcache_ctrl
   logic save_tag, rd_req_d, rd_req_q, rd_ack_d, rd_ack_q;
   localparam int unsigned CA_TAGSET_DEPTH = 8;
   localparam int unsigned CA_TAGSET_IDX_WIDTH = $clog2(CA_TAGSET_DEPTH);
+  logic ca_tag_hit;
+  logic [CVA6Cfg.PLEN-1:0] ca_tag_query_addr;
 
   // The tag set stores complete cache-line addresses, allowing untagOne and
   // invalidation detection to distinguish equal tags in different indices.
   logic ca_access_revoked_d, ca_access_revoked_q;
   logic [CA_TAGSET_DEPTH-1:0] ca_tag_active_d, ca_tag_active_q;
-  logic [CVA6Cfg.PLEN-1:0] ca_tagged_addr_d[CA_TAGSET_DEPTH];
-  logic [CVA6Cfg.PLEN-1:0] ca_tagged_addr_q[CA_TAGSET_DEPTH];
+  logic [CA_TAGSET_DEPTH-1:0][CVA6Cfg.PLEN-1:0] ca_tagged_addr_d, ca_tagged_addr_q;
   logic [CA_TAGSET_IDX_WIDTH-1:0] ca_tag_rr_d, ca_tag_rr_q;
   logic [1:0] data_size_d, data_size_q;
 
@@ -132,6 +132,20 @@ module wt_dcache_ctrl
   assign miss_wdata_o = '0;
   assign miss_wuser_o = '0;
 
+  assign ca_tag_query_addr = {address_tag_q, address_idx_q,
+                              {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}};
+
+  wt_dcache_ca_tag_cmp #(
+      .ADDR_WIDTH(CVA6Cfg.PLEN),
+      .DEPTH(CA_TAGSET_DEPTH)
+  ) i_ca_tag_cmp (
+      .valid_i     (ca_tag_active_q),
+      .addr_i      (ca_tagged_addr_q),
+      .query_addr_i(ca_tag_query_addr),
+      .match_oh_o  (),
+      .hit_o       (ca_tag_hit)
+  );
+
   // The revoked flag is sticky until software explicitly issues untagAll.
   always_comb begin
     ca_access_revoked_d = ca_access_revoked_q;
@@ -168,15 +182,9 @@ module wt_dcache_ctrl
       end
     end
 
-    // A returning miss for any tagged line means another agent invalidated it.
-    if (miss_rtrn_vld_i) begin
-      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
-        if (ca_tag_active_q[i] &&
-            (ca_tagged_addr_q[i] == {address_tag_q, address_idx_q,
-                                      {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}})) begin
-          ca_access_revoked_d = 1'b1;
-        end
-      end
+    // A returning miss for a tracked line means another agent invalidated it.
+    if (miss_rtrn_vld_i && ca_tag_hit) begin
+      ca_access_revoked_d = 1'b1;
     end
 
     // untagOne removes only the matching cache-line address.
