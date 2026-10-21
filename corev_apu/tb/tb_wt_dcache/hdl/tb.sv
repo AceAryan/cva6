@@ -67,6 +67,7 @@ module tb import tb_pkg::*; import ariane_pkg::*; import wt_cache_pkg::*; #()();
   dcache_req_i_t [2:0]            req_ports_i;
   dcache_req_o_t [2:0]            req_ports_o;
   logic                           mem_rtrn_vld_i;
+  logic                           mem_rtrn_ready;
   dcache_rtrn_t                   mem_rtrn_i;
   logic                           mem_data_req_o;
   logic                           mem_data_ack_i;
@@ -184,6 +185,7 @@ module tb import tb_pkg::*; import ariane_pkg::*; import wt_cache_pkg::*; #()();
     .mem_data_i     ( mem_data_o     ),
     .mem_rtrn_vld_o ( mem_rtrn_vld_i ),
     .mem_rtrn_o     ( mem_rtrn_i     ),
+    .mem_rtrn_ready_i( mem_rtrn_ready ),
     // for verification
     .seq_last_i     ( seq_last       ),
     .check_en_i     ( check_en       ),
@@ -217,6 +219,7 @@ module tb import tb_pkg::*; import ariane_pkg::*; import wt_cache_pkg::*; #()();
     .req_ports_o     ( req_ports_o     ),
     .mem_rtrn_vld_i  ( mem_rtrn_vld_i  ),
     .mem_rtrn_i      ( mem_rtrn_i      ),
+    .mem_rtrn_ready_o( mem_rtrn_ready  ),
     .mem_data_req_o  ( mem_data_req_o  ),
     .mem_data_ack_i  ( mem_data_ack_i  ),
     .mem_data_o      ( mem_data_o      )
@@ -619,8 +622,6 @@ module tb import tb_pkg::*; import ariane_pkg::*; import wt_cache_pkg::*; #()();
 
 
 endmodule
-
-
 
 
 

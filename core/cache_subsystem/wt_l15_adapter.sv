@@ -25,8 +25,8 @@
 //
 // 3) some features like blockinitstore, prefetch, ECC errors are not used (see interface below)
 //
-// 4) the arbiter can store upt to two outgoing requests per cache. incoming responses are passed
-//    through one streaming register, and need to be consumed unconditionally by the caches.
+// 4) the arbiter can store up to two outgoing requests per cache. Incoming responses are buffered;
+//    D-cache returns may be backpressured while serialized tag metadata is updated.
 //
 // 5) The L1.5 protocol is closely related to the CPX bus of openSPARC, see also [1,2]
 //
@@ -74,9 +74,10 @@ module wt_l15_adapter
     input  logic         dcache_data_req_i,
     output logic         dcache_data_ack_o,
     input  dcache_req_t  dcache_data_i,
-    // returning packets must be consumed immediately
+    // dcache returns may be backpressured while tag metadata is serialized
     output logic         dcache_rtrn_vld_o,
     output dcache_rtrn_t dcache_rtrn_o,
+    input  logic         dcache_rtrn_ready_i,
 
     // L15
     output l15_req_t  l15_req_o,
@@ -255,8 +256,8 @@ module wt_l15_adapter
 
   // acknowledge if we have space to hold this packet
   assign l15_req_o.l15_req_ack = l15_rtrn_i.l15_val & ~rtrn_fifo_full;
-  // packets have to be consumed immediately
-  assign rtrn_fifo_pop = ~rtrn_fifo_empty;
+  assign rtrn_fifo_pop = ~rtrn_fifo_empty &
+                         (~dcache_rtrn_vld_o | dcache_rtrn_ready_i);
 
   // decode packet type
   always_comb begin : p_rtrn_logic

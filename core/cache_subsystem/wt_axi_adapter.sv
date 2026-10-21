@@ -44,9 +44,10 @@ module wt_axi_adapter
     input  logic         dcache_data_req_i,
     output logic         dcache_data_ack_o,
     input  dcache_req_t  dcache_data_i,
-    // returning packets must be consumed immediately
+    // dcache returns may be backpressured while tag metadata is serialized
     output logic         dcache_rtrn_vld_o,
     output dcache_rtrn_t dcache_rtrn_o,
+    input  logic         dcache_rtrn_ready_i,
 
     // AXI port
     output axi_req_t axi_req_o,
@@ -512,6 +513,8 @@ module wt_axi_adapter
   wt_cache_pkg::dcache_in_t dcache_rtrn_type_d, dcache_rtrn_type_q;
   dcache_inval_t dcache_rtrn_inv_d, dcache_rtrn_inv_q;
   logic dcache_sc_rtrn, axi_rd_last;
+  logic dcache_rtrn_slot_ready;
+  assign dcache_rtrn_slot_ready = ~dcache_rtrn_vld_q | dcache_rtrn_ready_i;
 
   always_comb begin : p_axi_rtrn_shift
     // output directly from regs
@@ -587,7 +590,9 @@ module wt_axi_adapter
   always_comb begin : p_axi_rtrn_decode
     // we are not ready when invalidating
     // note: b's are buffered separately
-    axi_rd_rdy        = ~invalidate;
+    axi_rd_rdy        = ~invalidate &
+                        (dcache_rtrn_slot_ready ||
+                         !(axi_rd_valid && axi_rd_id_out[0]));
 
     icache_rtrn_rd_en = 1'b0;
     icache_rtrn_vld_d = 1'b0;
@@ -611,7 +616,7 @@ module wt_axi_adapter
     // External invalidation requests (from coprocessor). This is safe as
     // there are no other transactions when a coprocessor has pending stores.
     inval_ready_o      = 1'b0;
-    if (inval_valid_i) begin
+    if (inval_valid_i && dcache_rtrn_slot_ready) begin
       inval_ready_o         = 1'b1;
       dcache_rtrn_type_d    = wt_cache_pkg::DCACHE_INV_REQ;
       dcache_rtrn_vld_d     = 1'b1;
@@ -625,7 +630,7 @@ module wt_axi_adapter
       // note that this self invalidation is handled in this way due to the
       // write-through cache architecture, which is aligned with the openpiton
       // cache subsystem.
-    end else if (CVA6Cfg.RVA && invalidate) begin
+    end else if (CVA6Cfg.RVA && invalidate && dcache_rtrn_slot_ready) begin
       dcache_rtrn_type_d = wt_cache_pkg::DCACHE_INV_REQ;
       dcache_rtrn_vld_d = 1'b1;
 
@@ -655,7 +660,7 @@ module wt_axi_adapter
       end
       //////////////////////////////////////
       // write responses, check b fifo
-    end else if (!b_empty) begin
+    end else if (!b_empty && dcache_rtrn_slot_ready) begin
       b_pop = 1'b1;
 
       // this was an atomic
@@ -709,17 +714,19 @@ module wt_axi_adapter
       amo_gen_r_q            <= 1'b0;
     end else begin
       icache_first_q         <= icache_first_d;
-      dcache_first_q         <= dcache_first_d;
       icache_rd_shift_q      <= icache_rd_shift_d;
       icache_rd_shift_user_q <= icache_rd_shift_user_d;
-      dcache_rd_shift_q      <= dcache_rd_shift_d;
-      dcache_rd_shift_user_q <= dcache_rd_shift_user_d;
       icache_rtrn_vld_q      <= icache_rtrn_vld_d;
-      dcache_rtrn_vld_q      <= dcache_rtrn_vld_d;
       icache_rtrn_tid_q      <= icache_rtrn_tid_d;
-      dcache_rtrn_tid_q      <= dcache_rtrn_tid_d;
-      dcache_rtrn_type_q     <= dcache_rtrn_type_d;
-      dcache_rtrn_inv_q      <= dcache_rtrn_inv_d;
+      if (dcache_rtrn_slot_ready) begin
+        dcache_first_q         <= dcache_first_d;
+        dcache_rd_shift_q      <= dcache_rd_shift_d;
+        dcache_rd_shift_user_q <= dcache_rd_shift_user_d;
+        dcache_rtrn_vld_q      <= dcache_rtrn_vld_d;
+        dcache_rtrn_tid_q      <= dcache_rtrn_tid_d;
+        dcache_rtrn_type_q     <= dcache_rtrn_type_d;
+        dcache_rtrn_inv_q      <= dcache_rtrn_inv_d;
+      end
       amo_off_q              <= amo_off_d;
       amo_gen_r_q            <= amo_gen_r_d;
     end

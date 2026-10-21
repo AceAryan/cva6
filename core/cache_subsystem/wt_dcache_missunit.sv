@@ -118,7 +118,8 @@ module wt_dcache_missunit
     FLUSH,
     STORE_WAIT,
     LOAD_WAIT,
-    AMO_WAIT
+    AMO_WAIT,
+    FLUSH_WAIT
   } state_e;
   state_e state_d, state_q;
 
@@ -583,14 +584,17 @@ module wt_dcache_missunit
       // flush the cache
       FLUSH: begin
         // internal flush signal
-        flush_en = wr_cl_ready_i & ~flush_done;
-        if (flush_done) begin
-          if (wr_cl_ready_i) begin
-            state_d     = IDLE;
-            flush_ack_o = flush_ack_q;
-            flush_ack_d = 1'b0;
-            enable_d    = enable_i;
-          end
+        flush_en = wr_cl_ready_i;
+        if (flush_done && wr_cl_ready_i) begin
+          state_d = FLUSH_WAIT;
+        end
+      end
+      FLUSH_WAIT: begin
+        if (wr_cl_ready_i) begin
+          state_d     = IDLE;
+          flush_ack_o = flush_ack_q;
+          flush_ack_d = 1'b0;
+          enable_d    = enable_i;
         end
       end
       //////////////////////////////////
@@ -668,7 +672,10 @@ module wt_dcache_missunit
 
   read_tid :
   assert property (
-    @(posedge clk_i) disable iff (!rst_ni) mshr_vld_q |-> mem_rtrn_vld_i |-> load_ack |-> mem_rtrn_i.tid == mshr_q.id)
+    @(posedge clk_i) disable iff (!rst_ni)
+      (mshr_vld_q && mem_rtrn_vld_i && mem_rtrn_ready_o &&
+       mem_rtrn_i.rtype == DCACHE_LOAD_ACK) |->
+      (load_ack && mem_rtrn_i.tid == mshr_q.id))
   else $fatal(1, "[l1 dcache missunit] TID of load response doesn't match");
 
   read_ports :
