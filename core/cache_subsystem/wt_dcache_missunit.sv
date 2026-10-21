@@ -46,6 +46,7 @@ module wt_dcache_missunit
     input logic [NumPorts-1:0] miss_we_i,
     input logic [NumPorts-1:0][CVA6Cfg.XLEN-1:0] miss_wdata_i,
     input logic [NumPorts-1:0][CVA6Cfg.DCACHE_USER_WIDTH-1:0] miss_wuser_i,
+    input logic [NumPorts-1:0] miss_ca_i,
     input logic [NumPorts-1:0][CVA6Cfg.PLEN-1:0] miss_paddr_i,
     input logic [NumPorts-1:0][CVA6Cfg.DCACHE_SET_ASSOC-1:0] miss_vld_bits_i,
     input logic [NumPorts-1:0][2:0] miss_size_i,
@@ -69,9 +70,12 @@ module wt_dcache_missunit
     output logic [CVA6Cfg.DCACHE_USER_LINE_WIDTH-1:0] wr_cl_user_o,
     output logic [CVA6Cfg.DCACHE_LINE_WIDTH/8-1:0] wr_cl_data_be_o,
     output logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_vld_bits_o,
+    output logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_ca_tag_bits_o,
+    input logic wr_cl_ready_i,
     // memory interface
     input logic mem_rtrn_vld_i,
     input dcache_rtrn_t mem_rtrn_i,
+    output logic mem_rtrn_ready_o,
     output logic mem_data_req_o,
     input logic mem_data_ack_i,
     output dcache_req_t mem_data_o
@@ -125,6 +129,7 @@ module wt_dcache_missunit
     logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0]         vld_bits;
     logic [CVA6Cfg.MEM_TID_WIDTH-1:0]            id;
     logic                                        nc;
+    logic                                        ca_line;
     logic [$clog2(CVA6Cfg.DCACHE_SET_ASSOC)-1:0] repl_way;
     logic [$clog2(NumPorts)-1:0]                 miss_port_idx;
   } mshr_t;
@@ -161,7 +166,7 @@ module wt_dcache_missunit
   ///////////////////////////////////////////////////////
 
   assign cache_en_o = enable_q;
-  assign cnt_d = (flush_en) ? cnt_q + 1 : '0;
+  assign cnt_d = (flush_en) ? cnt_q + 1 : (state_q == FLUSH) ? cnt_q : '0;
   assign flush_done = (cnt_q == CVA6Cfg.DCACHE_NUM_WORDS - 1);
 
   assign miss_req_masked_d = (lock_reqs)  ? miss_req_masked_q      :
@@ -215,6 +220,7 @@ module wt_dcache_missunit
   assign mshr_d.vld_bits      = (mshr_allocate) ? miss_vld_bits_i[miss_port_idx] : mshr_q.vld_bits;
   assign mshr_d.id            = (mshr_allocate) ? miss_id_i[miss_port_idx] : mshr_q.id;
   assign mshr_d.nc            = (mshr_allocate) ? miss_nc_i[miss_port_idx] : mshr_q.nc;
+  assign mshr_d.ca_line       = (mshr_allocate) ? miss_ca_i[miss_port_idx] : mshr_q.ca_line;
   assign mshr_d.repl_way      = (mshr_allocate) ? repl_way : mshr_q.repl_way;
   assign mshr_d.miss_port_idx = (mshr_allocate) ? miss_port_idx : mshr_q.miss_port_idx;
 
@@ -373,7 +379,7 @@ module wt_dcache_missunit
     if (mem_rtrn_vld_i) begin
       unique case (mem_rtrn_i.rtype)
         DCACHE_LOAD_ACK: begin
-          if (mshr_vld_q) begin
+          if (mshr_vld_q && wr_cl_ready_i) begin
             load_ack = 1'b1;
             miss_rtrn_vld_o[mshr_q.miss_port_idx] = 1'b1;
           end
@@ -401,14 +407,27 @@ module wt_dcache_missunit
           end
         end
         DCACHE_INV_REQ: begin
-          inv_vld     = mem_rtrn_i.inv.vld | mem_rtrn_i.inv.all;
-          inv_vld_all = mem_rtrn_i.inv.all;
+          if (wr_cl_ready_i) begin
+            inv_vld     = mem_rtrn_i.inv.vld | mem_rtrn_i.inv.all;
+            inv_vld_all = mem_rtrn_i.inv.all;
+          end
         end
         // TODO:
         // DCACHE_INT_REQ: begin
         // end
         default: begin
         end
+      endcase
+    end
+  end
+
+  always_comb begin : p_rtrn_ready
+    mem_rtrn_ready_o = 1'b1;
+    if (mem_rtrn_vld_i) begin
+      case (mem_rtrn_i.rtype)
+        DCACHE_LOAD_ACK: mem_rtrn_ready_o = wr_cl_ready_i;
+        DCACHE_INV_REQ: mem_rtrn_ready_o = wr_cl_ready_i;
+        default: ;
       endcase
     end
   end
@@ -422,7 +441,7 @@ module wt_dcache_missunit
 
   // cacheline write port
   assign wr_cl_nc_o = mshr_q.nc;
-  assign wr_cl_vld_o = load_ack | (|wr_cl_we_o);
+  assign wr_cl_vld_o = cl_write_en | (|wr_cl_we_o);
 
   assign wr_cl_we_o = (flush_en) ? '1 : (inv_vld_all) ? '1 : (inv_vld) ? dcache_way_bin2oh(
       mem_rtrn_i.inv.way
@@ -433,6 +452,8 @@ module wt_dcache_missunit
   assign wr_vld_bits_o = (flush_en) ? '0 : (inv_vld) ? '0 : (cl_write_en) ? dcache_way_bin2oh(
       mshr_q.repl_way
   ) : '0;
+  assign wr_ca_tag_bits_o = (cl_write_en && mshr_q.ca_line) ?
+      dcache_way_bin2oh(mshr_q.repl_way) : '0;
 
   assign wr_cl_idx_o     = (flush_en) ? cnt_q                                                        :
                            (inv_vld)  ? mem_rtrn_i.inv.idx[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] :
@@ -562,12 +583,14 @@ module wt_dcache_missunit
       // flush the cache
       FLUSH: begin
         // internal flush signal
-        flush_en = 1'b1;
+        flush_en = wr_cl_ready_i & ~flush_done;
         if (flush_done) begin
-          state_d     = IDLE;
-          flush_ack_o = flush_ack_q;
-          flush_ack_d = 1'b0;
-          enable_d    = enable_i;
+          if (wr_cl_ready_i) begin
+            state_d     = IDLE;
+            flush_ack_o = flush_ack_q;
+            flush_ack_d = 1'b0;
+            enable_d    = enable_i;
+          end
         end
       end
       //////////////////////////////////

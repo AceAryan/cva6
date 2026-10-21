@@ -52,6 +52,7 @@ module wt_dcache_mem
     output logic [CVA6Cfg.DCACHE_USER_WIDTH-1:0] rd_user_o,
 
     // only available on port 0, uses address signals of port 0
+    output logic                                      wr_cl_ready_o,
     input logic                                      wr_cl_vld_i,
     input logic                                      wr_cl_nc_i,       // noncacheable access
     input logic [      CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_cl_we_i,       // writes a full cacheline
@@ -62,6 +63,15 @@ module wt_dcache_mem
     input logic [CVA6Cfg.DCACHE_USER_LINE_WIDTH-1:0] wr_cl_user_i,
     input logic [   CVA6Cfg.DCACHE_LINE_WIDTH/8-1:0] wr_cl_data_be_i,
     input logic [      CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_vld_bits_i,
+    input logic [      CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_ca_tag_bits_i,
+
+    input logic                                      ca_meta_req_i,
+    input logic                                      ca_meta_all_i,
+    input logic                                      ca_meta_set_i,
+    input logic [           DCACHE_CL_IDX_WIDTH-1:0] ca_meta_idx_i,
+    input logic [      CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_meta_tag_i,
+    output logic                                      ca_meta_ready_o,
+    output logic                                      ca_departed_o,
 
     // separate port for single word write, no tag access
     input logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] wr_req_i,  // write a single word to offset off_i[:3]
@@ -116,6 +126,26 @@ module wt_dcache_mem
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] vld_wdata;  // valid bits to write
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_TAG_WIDTH-1:0] tag_rdata;  // tags from the tag SRAM
   logic [DCACHE_CL_IDX_WIDTH-1:0] vld_addr;  // valid bit
+  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_TAG_WIDTH+1:0] tag_wdata;
+
+  typedef enum logic [2:0] {
+    META_IDLE,
+    META_LINE_READ,
+    META_CA_READ,
+    META_WRITE,
+    META_ALL_READ,
+    META_ALL_WRITE
+  } meta_state_e;
+  meta_state_e meta_state_q, meta_state_d;
+  logic [DCACHE_CL_IDX_WIDTH-1:0] meta_idx_q, meta_idx_d;
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] meta_tag_q, meta_tag_d;
+  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] meta_way_q, meta_way_d;
+  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] meta_valid_q, meta_valid_d;
+  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] meta_ca_q, meta_ca_d;
+  logic meta_line_write_q, meta_line_write_d;
+  logic meta_ca_set_q, meta_ca_set_d;
+  logic [DCACHE_CL_IDX_WIDTH-1:0] meta_all_idx_q, meta_all_idx_d;
+  logic wr_cl_accept, meta_start_line, meta_start_ca, meta_busy;
 
   logic [$clog2(NumPorts)-1:0] vld_sel_d, vld_sel_q;
 
@@ -143,22 +173,155 @@ module wt_dcache_mem
   // byte enable mapping
   for (genvar k = 0; k < DCACHE_NUM_BANKS; k++) begin : gen_bank
     for (genvar j = 0; j < CVA6Cfg.DCACHE_SET_ASSOC; j++) begin : gen_bank_way
-      assign bank_be[k][j]   = (wr_cl_we_i[j] & wr_cl_vld_i)  ? wr_cl_data_be_i[k*(CVA6Cfg.XLEN/8) +: (CVA6Cfg.XLEN/8)] :
+      assign bank_be[k][j]   = (wr_cl_we_i[j] & wr_cl_accept)  ? wr_cl_data_be_i[k*(CVA6Cfg.XLEN/8) +: (CVA6Cfg.XLEN/8)] :
                                (wr_req_i[j]   & wr_ack_o)     ? wr_data_be_i              :
                                                                 '0;
-      assign bank_wdata[k][j] = (wr_cl_we_i[j] & wr_cl_vld_i) ?  wr_cl_data_i[k*CVA6Cfg.XLEN +: CVA6Cfg.XLEN] :
+      assign bank_wdata[k][j] = (wr_cl_we_i[j] & wr_cl_accept) ?  wr_cl_data_i[k*CVA6Cfg.XLEN +: CVA6Cfg.XLEN] :
                                                                  wr_data_i;
-      assign bank_wuser[k][j] = (wr_cl_we_i[j] & wr_cl_vld_i) ?  wr_cl_user_i[k*CVA6Cfg.DCACHE_USER_WIDTH +: CVA6Cfg.DCACHE_USER_WIDTH] :
+      assign bank_wuser[k][j] = (wr_cl_we_i[j] & wr_cl_accept) ?  wr_cl_user_i[k*CVA6Cfg.DCACHE_USER_WIDTH +: CVA6Cfg.DCACHE_USER_WIDTH] :
                                                                  wr_user_i;
     end
   end
 
-  assign vld_wdata     = wr_vld_bits_i;
-  assign vld_addr      = (wr_cl_vld_i) ? wr_cl_idx_i : rd_idx_i[vld_sel_d];
+  assign wr_cl_ready_o = meta_state_q == META_IDLE;
+  assign ca_meta_ready_o = (meta_state_q == META_IDLE) & ~wr_cl_vld_i;
+  assign wr_cl_accept = wr_cl_vld_i & wr_cl_ready_o;
+  assign meta_start_line = wr_cl_accept;
+  assign meta_start_ca = ca_meta_req_i & ca_meta_ready_o;
+  assign meta_busy = meta_state_q != META_IDLE;
   assign rd_tag        = rd_tag_i[vld_sel_q];  //delayed by one cycle
-  assign bank_off_d    = (wr_cl_vld_i) ? wr_cl_off_i : rd_off_i[vld_sel_d];
-  assign bank_idx_d    = (wr_cl_vld_i) ? wr_cl_idx_i : rd_idx_i[vld_sel_d];
-  assign vld_req       = (wr_cl_vld_i) ? wr_cl_we_i : (rd_acked) ? '1 : '0;
+  assign bank_off_d    = (wr_cl_accept) ? wr_cl_off_i : rd_off_i[vld_sel_d];
+  assign bank_idx_d    = (wr_cl_accept) ? wr_cl_idx_i : rd_idx_i[vld_sel_d];
+
+  always_comb begin : p_meta_port
+    vld_req = '0;
+    vld_we = 1'b0;
+    vld_addr = rd_idx_i[vld_sel_d];
+    vld_wdata = '0;
+    ca_departed_o = 1'b0;
+
+    case (meta_state_q)
+      META_LINE_READ: begin
+        vld_req = '1;
+        vld_addr = meta_idx_q;
+      end
+      META_CA_READ: begin
+        vld_req = '1;
+        vld_addr = meta_idx_q;
+      end
+      META_WRITE: begin
+        vld_req = meta_way_q;
+        vld_we = 1'b1;
+        vld_addr = meta_idx_q;
+      end
+      META_ALL_READ: begin
+        vld_req = '1;
+        vld_addr = meta_all_idx_q;
+      end
+      META_ALL_WRITE: begin
+        vld_req = '1;
+        vld_we = 1'b1;
+        vld_addr = meta_all_idx_q;
+      end
+      default: begin
+        if (meta_start_line) begin
+          vld_req = '1;
+          vld_addr = wr_cl_idx_i;
+        end else if (meta_start_ca && !ca_meta_all_i) begin
+          vld_req = '1;
+          vld_addr = ca_meta_idx_i;
+        end else if (rd_acked) begin
+          vld_req = '1;
+          vld_addr = rd_idx_i[vld_sel_d];
+        end
+      end
+    endcase
+
+    for (int way = 0; way < CVA6Cfg.DCACHE_SET_ASSOC; way++) begin
+      if (meta_state_q == META_WRITE && meta_line_write_q) begin
+        tag_wdata[way] = {
+          meta_valid_q[way], meta_ca_q[way], meta_tag_q
+        };
+        vld_wdata[way] = meta_valid_q[way];
+      end else if (meta_state_q == META_WRITE) begin
+        tag_wdata[way] = {
+          vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1],
+          meta_ca_set_q && (tag_rdata[way] == meta_tag_q) &&
+              vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1] ? 1'b1 :
+          !meta_ca_set_q && (tag_rdata[way] == meta_tag_q) ? 1'b0 :
+              vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH],
+          tag_rdata[way]
+        };
+        vld_wdata[way] = tag_wdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1];
+      end else if (meta_state_q == META_ALL_WRITE) begin
+        tag_wdata[way] = {
+          vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1], 1'b0, tag_rdata[way]
+        };
+        vld_wdata[way] = vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1];
+      end else begin
+        tag_wdata[way] = '0;
+      end
+    end
+
+    if (meta_state_q == META_WRITE && meta_line_write_q) begin
+      for (int way = 0; way < CVA6Cfg.DCACHE_SET_ASSOC; way++) begin
+        ca_departed_o |= meta_way_q[way] &&
+            vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1] &&
+            vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH] &&
+            (!meta_valid_q[way] || (tag_rdata[way] != meta_tag_q));
+      end
+    end
+  end
+
+  always_comb begin : p_meta_state
+    meta_state_d = meta_state_q;
+    meta_idx_d = meta_idx_q;
+    meta_tag_d = meta_tag_q;
+    meta_way_d = meta_way_q;
+    meta_valid_d = meta_valid_q;
+    meta_ca_d = meta_ca_q;
+    meta_line_write_d = meta_line_write_q;
+    meta_ca_set_d = meta_ca_set_q;
+    meta_all_idx_d = meta_all_idx_q;
+
+    case (meta_state_q)
+      META_IDLE: begin
+        if (meta_start_line) begin
+          meta_idx_d = wr_cl_idx_i;
+          meta_tag_d = wr_cl_tag_i;
+          meta_way_d = wr_cl_we_i;
+          meta_valid_d = wr_vld_bits_i;
+          meta_ca_d = wr_ca_tag_bits_i;
+          meta_line_write_d = 1'b1;
+          meta_state_d = META_LINE_READ;
+        end else if (meta_start_ca) begin
+          meta_idx_d = ca_meta_idx_i;
+          meta_tag_d = ca_meta_tag_i;
+          meta_way_d = '1;
+          meta_line_write_d = 1'b0;
+          meta_ca_set_d = ca_meta_set_i;
+          if (ca_meta_all_i) begin
+            meta_all_idx_d = '0;
+            meta_state_d = META_ALL_READ;
+          end else begin
+            meta_state_d = META_CA_READ;
+          end
+        end
+      end
+      META_LINE_READ, META_CA_READ: meta_state_d = META_WRITE;
+      META_WRITE: meta_state_d = META_IDLE;
+      META_ALL_READ: meta_state_d = META_ALL_WRITE;
+      META_ALL_WRITE: begin
+        if (meta_all_idx_q == CVA6Cfg.DCACHE_NUM_WORDS - 1) begin
+          meta_state_d = META_IDLE;
+        end else begin
+          meta_all_idx_d = meta_all_idx_q + 1'b1;
+          meta_state_d = META_ALL_READ;
+        end
+      end
+      default: meta_state_d = META_IDLE;
+    endcase
+  end
 
 
   // priority masking
@@ -178,16 +341,15 @@ module wt_dcache_mem
       .req_i  (rd_req_masked),
       .gnt_o  (rd_ack_o),
       .data_i ('0),
-      .gnt_i  (~wr_cl_vld_i),
+      .gnt_i  (~wr_cl_vld_i & ~meta_busy & ~ca_meta_req_i),
       .req_o  (rd_req),
       .data_o (),
       .idx_o  (vld_sel_d)
   );
 
-  assign rd_acked = rd_req & ~wr_cl_vld_i;
+  assign rd_acked = rd_req & ~wr_cl_vld_i & ~meta_busy & ~ca_meta_req_i;
 
   always_comb begin : p_bank_req
-    vld_we   = wr_cl_vld_i;
     bank_req = '0;
     wr_ack_o = '0;
     bank_we  = '0;
@@ -197,7 +359,7 @@ module wt_dcache_mem
       bank_collision[k] = rd_off_i[k][CVA6Cfg.DCACHE_OFFSET_WIDTH-1:CVA6Cfg.XLEN_ALIGN_BYTES] == wr_off_i[CVA6Cfg.DCACHE_OFFSET_WIDTH-1:CVA6Cfg.XLEN_ALIGN_BYTES];
     end
 
-    if (wr_cl_vld_i & |wr_cl_we_i) begin
+    if (wr_cl_accept & |wr_cl_we_i) begin
       bank_req = '1;
       bank_we  = '1;
       bank_idx = '{default: wr_cl_idx_i};
@@ -210,7 +372,7 @@ module wt_dcache_mem
         end
       end
 
-      if (|wr_req_i) begin
+      if (|wr_req_i && !meta_busy) begin
         if (rd_tag_only_i[vld_sel_d] || !(rd_ack_o[vld_sel_d] && bank_collision[vld_sel_d])) begin
           wr_ack_o = 1'b1;
           bank_req |= dcache_cl_bin2oh(
@@ -301,8 +463,8 @@ module wt_dcache_mem
   // memory arrays and regs
   ///////////////////////////////////////////////////////
 
-  // Each way stores one packed tag entry: [valid | address tag].
-  logic [CVA6Cfg.DCACHE_TAG_WIDTH:0] vld_tag_rdata[CVA6Cfg.DCACHE_SET_ASSOC-1:0];
+  // Each way stores one packed tag entry: [valid | CA | address tag].
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH+1:0] vld_tag_rdata[CVA6Cfg.DCACHE_SET_ASSOC-1:0];
 
   for (genvar k = 0; k < DCACHE_NUM_BANKS; k++) begin : gen_data_banks
     // Data RAM
@@ -330,12 +492,12 @@ module wt_dcache_mem
   for (genvar i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin : gen_tag_srams
 
     assign tag_rdata[i]     = vld_tag_rdata[i][CVA6Cfg.DCACHE_TAG_WIDTH-1:0];
-    assign rd_vld_bits_o[i] = vld_tag_rdata[i][CVA6Cfg.DCACHE_TAG_WIDTH];
+    assign rd_vld_bits_o[i] = vld_tag_rdata[i][CVA6Cfg.DCACHE_TAG_WIDTH+1];
 
     // Tag RAM
     sram_cache #(
-        // Address tag and valid bit.
-        .DATA_WIDTH (CVA6Cfg.DCACHE_TAG_WIDTH + 1),
+        // Address tag, CA marker, and valid bit.
+        .DATA_WIDTH (CVA6Cfg.DCACHE_TAG_WIDTH + 2),
         .BYTE_ACCESS(0),
         .TECHNO_CUT (CVA6Cfg.TechnoCut),
         .NUM_WORDS  (CVA6Cfg.DCACHE_NUM_WORDS)
@@ -346,7 +508,7 @@ module wt_dcache_mem
         .we_i   (vld_we),
         .addr_i (vld_addr),
         .wuser_i('0),
-        .wdata_i({vld_wdata[i], wr_cl_tag_i}),
+        .wdata_i(tag_wdata[i]),
         .be_i   ('1),
         .ruser_o(),
         .rdata_o(vld_tag_rdata[i])
@@ -359,11 +521,29 @@ module wt_dcache_mem
       bank_off_q <= '0;
       vld_sel_q  <= '0;
       cmp_en_q   <= '0;
+      meta_state_q <= META_IDLE;
+      meta_idx_q <= '0;
+      meta_tag_q <= '0;
+      meta_way_q <= '0;
+      meta_valid_q <= '0;
+      meta_ca_q <= '0;
+      meta_line_write_q <= 1'b0;
+      meta_ca_set_q <= 1'b0;
+      meta_all_idx_q <= '0;
     end else begin
       bank_idx_q <= bank_idx_d;
       bank_off_q <= bank_off_d;
       vld_sel_q  <= vld_sel_d;
       cmp_en_q   <= cmp_en_d;
+      meta_state_q <= meta_state_d;
+      meta_idx_q <= meta_idx_d;
+      meta_tag_q <= meta_tag_d;
+      meta_way_q <= meta_way_d;
+      meta_valid_q <= meta_valid_d;
+      meta_ca_q <= meta_ca_d;
+      meta_line_write_q <= meta_line_write_d;
+      meta_ca_set_q <= meta_ca_set_d;
+      meta_all_idx_q <= meta_all_idx_d;
     end
   end
 
@@ -420,14 +600,17 @@ module wt_dcache_mem
       for (int i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin
         if (vld_req[i] & vld_we) begin
           vld_mirror[vld_addr][i] <= vld_wdata[i];
-          tag_mirror[vld_addr][i] <= wr_cl_tag_i;
+          tag_mirror[vld_addr][i] <= tag_wdata[i][CVA6Cfg.DCACHE_TAG_WIDTH-1:0];
         end
       end
     end
   end
 
   for (genvar i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin : gen_tag_dubl_test
-    assign tag_write_duplicate_test[i] = (tag_mirror[vld_addr][i] == wr_cl_tag_i) & vld_mirror[vld_addr][i] & (|vld_wdata);
+    assign tag_write_duplicate_test[i] = meta_line_write_q &&
+                                         (meta_state_q == META_WRITE) &&
+                                         (tag_mirror[vld_addr][i] == meta_tag_q) &
+                                         vld_mirror[vld_addr][i] & (|vld_wdata);
   end
 
   tag_write_duplicate :

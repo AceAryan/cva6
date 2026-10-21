@@ -42,6 +42,7 @@ module wt_dcache_ctrl
     output logic [CVA6Cfg.MEM_TID_WIDTH-1:0] miss_id_o,  // set to constant ID
     input logic miss_replay_i,  // request collided with pending miss - have to replay the request
     input  logic                            miss_rtrn_vld_i, // signals that the miss has been served, asserted in the same cycle as when the data returns from memory
+    input logic ca_departed_i,
     // used to detect readout mux collisions
     input logic wr_cl_vld_i,
     // cache memory interface
@@ -61,6 +62,13 @@ module wt_dcache_ctrl
     input logic ca_untag_one_i,
     input logic ca_untag_all_i,
     input logic [CVA6Cfg.PLEN-1:0] ca_untag_addr_i,
+    output logic miss_ca_o,
+    output logic ca_meta_req_o,
+    output logic ca_meta_all_o,
+    output logic ca_meta_set_o,
+    output logic [DCACHE_CL_IDX_WIDTH-1:0] ca_meta_idx_o,
+    output logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_meta_tag_o,
+    input logic ca_meta_ready_i,
     output logic ca_access_revoked_o,
     output logic ca_tag_set_o
 );
@@ -84,17 +92,13 @@ module wt_dcache_ctrl
   logic [CVA6Cfg.DcacheIdWidth-1:0] id_d, id_q;
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] vld_data_d, vld_data_q;
   logic save_tag, rd_req_d, rd_req_q, rd_ack_d, rd_ack_q;
-  localparam int unsigned CA_TAGSET_DEPTH = 8;
-  localparam int unsigned CA_TAGSET_IDX_WIDTH = $clog2(CA_TAGSET_DEPTH);
-  logic ca_tag_hit;
-  logic [CVA6Cfg.PLEN-1:0] ca_tag_query_addr;
-
-  // The tag set stores complete cache-line addresses, allowing untagOne and
-  // invalidation detection to distinguish equal tags in different indices.
   logic ca_access_revoked_d, ca_access_revoked_q;
-  logic [CA_TAGSET_DEPTH-1:0] ca_tag_active_d, ca_tag_active_q;
-  logic [CA_TAGSET_DEPTH-1:0][CVA6Cfg.PLEN-1:0] ca_tagged_addr_d, ca_tagged_addr_q;
-  logic [CA_TAGSET_IDX_WIDTH-1:0] ca_tag_rr_d, ca_tag_rr_q;
+  logic ca_cread_d, ca_cread_q;
+  logic ca_untag_one_d, ca_untag_one_q;
+  logic ca_untag_all_d, ca_untag_all_q;
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_op_tag_d, ca_op_tag_q;
+  logic [DCACHE_CL_IDX_WIDTH-1:0] ca_op_idx_d, ca_op_idx_q;
+  logic ca_meta_needed;
   logic [1:0] data_size_d, data_size_q;
 
   ///////////////////////////////////////////////////////
