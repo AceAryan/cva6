@@ -26,6 +26,7 @@ module wt_dcache_ctrl
     input logic clk_i,  // Clock
     input logic rst_ni,  // Asynchronous reset active low
     input logic cache_en_i,
+    input logic ca_access_revoked_i,
     // core request ports
     input dcache_req_i_t req_port_i,
     output dcache_req_o_t req_port_o,
@@ -42,7 +43,6 @@ module wt_dcache_ctrl
     output logic [CVA6Cfg.MEM_TID_WIDTH-1:0] miss_id_o,  // set to constant ID
     input logic miss_replay_i,  // request collided with pending miss - have to replay the request
     input  logic                            miss_rtrn_vld_i, // signals that the miss has been served, asserted in the same cycle as when the data returns from memory
-    input logic ca_departed_i,
     // used to detect readout mux collisions
     input logic wr_cl_vld_i,
     // cache memory interface
@@ -61,16 +61,13 @@ module wt_dcache_ctrl
     input logic ca_cwrite_i,
     input logic ca_untag_one_i,
     input logic ca_untag_all_i,
-    input logic [CVA6Cfg.PLEN-1:0] ca_untag_addr_i,
     output logic miss_ca_o,
     output logic ca_meta_req_o,
     output logic ca_meta_all_o,
     output logic ca_meta_set_o,
     output logic [DCACHE_CL_IDX_WIDTH-1:0] ca_meta_idx_o,
     output logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_meta_tag_o,
-    input logic ca_meta_ready_i,
-    output logic ca_access_revoked_o,
-    output logic ca_tag_set_o
+    input logic ca_meta_ready_i
 );
 
   // controller FSM
@@ -92,12 +89,9 @@ module wt_dcache_ctrl
   logic [CVA6Cfg.DcacheIdWidth-1:0] id_d, id_q;
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] vld_data_d, vld_data_q;
   logic save_tag, rd_req_d, rd_req_q, rd_ack_d, rd_ack_q;
-  logic ca_access_revoked_d, ca_access_revoked_q;
   logic ca_cread_d, ca_cread_q;
   logic ca_untag_one_d, ca_untag_one_q;
   logic ca_untag_all_d, ca_untag_all_q;
-  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_op_tag_d, ca_op_tag_q;
-  logic [DCACHE_CL_IDX_WIDTH-1:0] ca_op_idx_d, ca_op_idx_q;
   logic ca_meta_needed;
   logic [1:0] data_size_d, data_size_q;
 
@@ -136,89 +130,43 @@ module wt_dcache_ctrl
   assign miss_wdata_o = '0;
   assign miss_wuser_o = '0;
 
-  assign ca_tag_query_addr = {address_tag_q, address_idx_q,
-                              {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}};
-
-  wt_dcache_ca_tag_cmp #(
-      .ADDR_WIDTH(CVA6Cfg.PLEN),
-      .DEPTH(CA_TAGSET_DEPTH)
-  ) i_ca_tag_cmp (
-      .valid_i     (ca_tag_active_q),
-      .addr_i      (ca_tagged_addr_q),
-      .query_addr_i(ca_tag_query_addr),
-      .match_oh_o  (),
-      .hit_o       (ca_tag_hit)
-  );
-
-  // The revoked flag is sticky until software explicitly issues untagAll.
   always_comb begin
-    ca_access_revoked_d = ca_access_revoked_q;
-    ca_tag_active_d     = ca_tag_active_q;
-    ca_tag_rr_d         = ca_tag_rr_q;
-    for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
-      ca_tagged_addr_d[i] = ca_tagged_addr_q[i];
+    ca_cread_d = ca_cread_q;
+    ca_untag_one_d = ca_untag_one_q;
+    ca_untag_all_d = ca_untag_all_q;
+
+    if (ca_meta_req_o && ca_meta_ready_i) begin
+      ca_untag_one_d = 1'b0;
+      ca_untag_all_d = 1'b0;
     end
 
-    // Capture only an accepted cread. Duplicate tags do not consume another slot.
-    if (ca_cread_i && req_port_o.data_gnt) begin
-      logic duplicate;
-      logic slot_found;
-      logic [CA_TAGSET_IDX_WIDTH-1:0] slot;
-      duplicate = 1'b0;
-      slot_found = 1'b0;
-      slot = ca_tag_rr_q;
-      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
-        if (ca_tag_active_q[i] &&
-            (ca_tagged_addr_q[i] == {address_tag_d, address_idx_d,
-                                      {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}})) begin
-          duplicate = 1'b1;
-        end
-        if (!slot_found && !ca_tag_active_q[i]) begin
-          slot = CA_TAGSET_IDX_WIDTH'(i);
-          slot_found = 1'b1;
-        end
-      end
-      if (!duplicate) begin
-        ca_tag_active_d[slot] = 1'b1;
-        ca_tagged_addr_d[slot] = {address_tag_d, address_idx_d,
-                                   {CVA6Cfg.DCACHE_OFFSET_WIDTH{1'b0}}};
-        ca_tag_rr_d = (slot == CA_TAGSET_DEPTH - 1) ? '0 : slot + 1'b1;
-      end
+    if (req_port_o.data_gnt) begin
+      ca_cread_d = ca_cread_i;
+      ca_untag_one_d = ca_untag_one_i;
+      ca_untag_all_d = ca_untag_all_i;
     end
-
-    // A returning miss for a tracked line means another agent invalidated it.
-    if (miss_rtrn_vld_i && ca_tag_hit) begin
-      ca_access_revoked_d = 1'b1;
-    end
-
-    // untagOne removes only the matching cache-line address.
-    if (ca_untag_one_i) begin
-      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
-        if (ca_tag_active_q[i] && (ca_tagged_addr_q[i] == ca_untag_addr_i)) begin
-          ca_tag_active_d[i] = 1'b0;
-        end
-      end
-    end
-
-    // untagAll is the explicit cleanup point for all CA state.
-    if (ca_untag_all_i) begin
-      ca_access_revoked_d = 1'b0;
-      ca_tag_active_d     = '0;
-      ca_tag_rr_d         = '0;
-      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
-        ca_tagged_addr_d[i] = '0;
-      end
+    if (!req_port_o.data_gnt && (req_port_o.data_rvalid || miss_rtrn_vld_i)) begin
+      ca_cread_d = 1'b0;
     end
   end
 
-  assign ca_access_revoked_o = ca_access_revoked_q;
-  assign ca_tag_set_o        = |ca_tag_active_q;
-  assign req_port_o.ca_access_revoked = ca_access_revoked_q;
+  assign req_port_o.ca_access_revoked = ca_access_revoked_i;
   assign req_port_o.data_error = 1'b0;
   assign miss_id_o = RdTxId;
   assign rd_req_d = rd_req_o;
   assign rd_ack_d = rd_ack_i;
   assign rd_tag_only_o = '0;
+  assign miss_ca_o = ca_cread_q;
+  assign ca_meta_needed = ca_untag_all_q ||
+                          ((req_port_i.tag_valid || state_q == REPLAY_READ) &&
+                           (ca_untag_one_q ||
+                            (ca_cread_q && rd_ack_q && (|rd_hit_oh_i) && cache_en_i)));
+  assign ca_meta_req_o = ((state_q == READ && req_port_i.tag_valid) ||
+                          state_q == REPLAY_READ) && ca_meta_needed;
+  assign ca_meta_all_o = ca_untag_all_q;
+  assign ca_meta_set_o = ca_cread_q;
+  assign ca_meta_idx_o = address_idx_q;
+  assign ca_meta_tag_o = address_tag_d;
 
   ///////////////////////////////////////////////////////
   // main control logic
@@ -256,13 +204,15 @@ module wt_dcache_ctrl
       READ, REPLAY_READ: begin
         // speculatively request cache line
         rd_req_o = 1'b1;
+        save_tag = (state_q != REPLAY_READ) && req_port_i.tag_valid;
 
         // kill -> go back to IDLE
         if (req_port_i.kill_req) begin
           state_d = IDLE;
           req_port_o.data_rvalid = 1'b1;
+        end else if (ca_meta_needed && !ca_meta_ready_i) begin
+          state_d = READ;
         end else if (req_port_i.tag_valid | state_q == REPLAY_READ) begin
-          save_tag = (state_q != REPLAY_READ);
           if (wr_cl_vld_i || !rd_ack_q) begin
             state_d = REPLAY_REQ;
             // we've got a hit
@@ -270,7 +220,7 @@ module wt_dcache_ctrl
             state_d = IDLE;
             req_port_o.data_rvalid = 1'b1;
             // we can handle another request
-            if (rd_ack_i && req_port_i.data_req) begin
+            if (rd_ack_i && req_port_i.data_req && !ca_meta_needed) begin
               state_d = READ;
               req_port_o.data_gnt = 1'b1;
             end
@@ -367,13 +317,9 @@ module wt_dcache_ctrl
       data_size_q   <= '0;
       rd_req_q      <= '0;
       rd_ack_q      <= '0;
-      // Reset the bounded tag set and its replacement cursor with the cache controller.
-      ca_access_revoked_q <= '0;
-      ca_tag_active_q     <= '0;
-      ca_tag_rr_q         <= '0;
-      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
-        ca_tagged_addr_q[i] <= '0;
-      end
+      ca_cread_q <= 1'b0;
+      ca_untag_one_q <= 1'b0;
+      ca_untag_all_q <= 1'b0;
     end else begin
       state_q       <= state_d;
       address_tag_q <= address_tag_d;
@@ -384,13 +330,9 @@ module wt_dcache_ctrl
       data_size_q   <= data_size_d;
       rd_req_q      <= rd_req_d;
       rd_ack_q      <= rd_ack_d;
-      // Commit the next-cycle CA state alongside the controller state.
-      ca_access_revoked_q <= ca_access_revoked_d;
-      ca_tag_active_q     <= ca_tag_active_d;
-      ca_tag_rr_q         <= ca_tag_rr_d;
-      for (int i = 0; i < CA_TAGSET_DEPTH; i++) begin
-        ca_tagged_addr_q[i] <= ca_tagged_addr_d[i];
-      end
+      ca_cread_q <= ca_cread_d;
+      ca_untag_one_q <= ca_untag_one_d;
+      ca_untag_all_q <= ca_untag_all_d;
     end
   end
 

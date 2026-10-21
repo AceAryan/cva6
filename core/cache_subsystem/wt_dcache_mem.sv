@@ -71,6 +71,7 @@ module wt_dcache_mem
     input logic [           DCACHE_CL_IDX_WIDTH-1:0] ca_meta_idx_i,
     input logic [      CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_meta_tag_i,
     output logic                                      ca_meta_ready_o,
+    output logic                                      meta_busy_o,
     output logic                                      ca_departed_o,
 
     // separate port for single word write, no tag access
@@ -125,6 +126,7 @@ module wt_dcache_mem
   logic vld_we;  // valid bits write enable
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] vld_wdata;  // valid bits to write
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_TAG_WIDTH-1:0] tag_rdata;  // tags from the tag SRAM
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH+1:0] vld_tag_rdata[CVA6Cfg.DCACHE_SET_ASSOC-1:0];
   logic [DCACHE_CL_IDX_WIDTH-1:0] vld_addr;  // valid bit
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_TAG_WIDTH+1:0] tag_wdata;
 
@@ -189,6 +191,7 @@ module wt_dcache_mem
   assign meta_start_line = wr_cl_accept;
   assign meta_start_ca = ca_meta_req_i & ca_meta_ready_o;
   assign meta_busy = meta_state_q != META_IDLE;
+  assign meta_busy_o = meta_busy;
   assign rd_tag        = rd_tag_i[vld_sel_q];  //delayed by one cycle
   assign bank_off_d    = (wr_cl_accept) ? wr_cl_off_i : rd_off_i[vld_sel_d];
   assign bank_idx_d    = (wr_cl_accept) ? wr_cl_idx_i : rd_idx_i[vld_sel_d];
@@ -246,10 +249,9 @@ module wt_dcache_mem
       end else if (meta_state_q == META_WRITE) begin
         tag_wdata[way] = {
           vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1],
-          meta_ca_set_q && (tag_rdata[way] == meta_tag_q) &&
-              vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1] ? 1'b1 :
-          !meta_ca_set_q && (tag_rdata[way] == meta_tag_q) ? 1'b0 :
-              vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH],
+          vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1] ?
+              ((tag_rdata[way] == meta_tag_q) ? meta_ca_set_q :
+               vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH]) : 1'b0,
           tag_rdata[way]
         };
         vld_wdata[way] = tag_wdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1];
@@ -394,7 +396,7 @@ module wt_dcache_mem
   logic [                   $clog2(CVA6Cfg.WtDcacheWbufDepth)-1:0] wbuffer_hit_idx;
   logic [                    $clog2(CVA6Cfg.DCACHE_SET_ASSOC)-1:0] rd_hit_idx;
 
-  assign cmp_en_d = (|vld_req) & ~vld_we;
+  assign cmp_en_d = rd_acked;
 
   // word tag comparison in write buffer
   assign wbuffer_cmp_addr = (wr_cl_vld_i) ? {wr_cl_tag_i, wr_cl_idx_i, wr_cl_off_i} :
@@ -464,8 +466,6 @@ module wt_dcache_mem
   ///////////////////////////////////////////////////////
 
   // Each way stores one packed tag entry: [valid | CA | address tag].
-  logic [CVA6Cfg.DCACHE_TAG_WIDTH+1:0] vld_tag_rdata[CVA6Cfg.DCACHE_SET_ASSOC-1:0];
-
   for (genvar k = 0; k < DCACHE_NUM_BANKS; k++) begin : gen_data_banks
     // Data RAM
     sram_cache #(

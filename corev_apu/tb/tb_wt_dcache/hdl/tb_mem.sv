@@ -35,6 +35,7 @@ module tb_mem import tb_pkg::*; import ariane_pkg::*; import wt_cache_pkg::*;#(
   // dcache interface
   output logic           mem_rtrn_vld_o,
   output dcache_rtrn_t   mem_rtrn_o,
+  input  logic           mem_rtrn_ready_i,
   input  logic           mem_data_req_i,
   output logic           mem_data_ack_o,
   input  dcache_req_t    mem_data_i,
@@ -281,8 +282,8 @@ module tb_mem import tb_pkg::*; import ariane_pkg::*; import wt_cache_pkg::*;#(
     .pop_i       ( infifo_pop    )
   );
 
-  assign infifo_pop     = ~infifo_empty;
-  assign mem_rtrn_vld_o = infifo_pop;
+  assign mem_rtrn_vld_o = ~infifo_empty;
+  assign infifo_pop     = mem_rtrn_vld_o & mem_rtrn_ready_i;
 
 
 ///////////////////////////////////////////////////////

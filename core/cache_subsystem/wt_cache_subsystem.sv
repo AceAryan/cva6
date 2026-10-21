@@ -110,6 +110,7 @@ module wt_cache_subsystem
 
 
   logic dcache_adapter_data_req, adapter_dcache_data_ack, adapter_dcache_rtrn_vld;
+  logic adapter_dcache_rtrn_ready;
   dcache_req_t  dcache_adapter;
   dcache_rtrn_t adapter_dcache;
 
@@ -171,6 +172,7 @@ module wt_cache_subsystem
       .miss_vld_bits_o (miss_vld_bits_o),
       .mem_rtrn_vld_i  (adapter_dcache_rtrn_vld),
       .mem_rtrn_i      (adapter_dcache),
+      .mem_rtrn_ready_o(adapter_dcache_rtrn_ready),
       .mem_data_req_o  (dcache_adapter_data_req),
       .mem_data_ack_i  (adapter_dcache_data_ack),
       .mem_data_o      (dcache_adapter)
@@ -202,6 +204,7 @@ module wt_cache_subsystem
       .dcache_data_i    (dcache_adapter),
       .dcache_rtrn_vld_o(adapter_dcache_rtrn_vld),
       .dcache_rtrn_o    (adapter_dcache),
+      .dcache_rtrn_ready_i(adapter_dcache_rtrn_ready),
       .l15_req_o        (noc_req_o),
       .l15_rtrn_i       (noc_resp_i)
   );
@@ -228,6 +231,7 @@ module wt_cache_subsystem
       .dcache_data_i    (dcache_adapter),
       .dcache_rtrn_vld_o(adapter_dcache_rtrn_vld),
       .dcache_rtrn_o    (adapter_dcache),
+      .dcache_rtrn_ready_i(adapter_dcache_rtrn_ready),
       .axi_req_o        (noc_req_o),
       .axi_resp_i       (noc_resp_i),
       .mbe_i            (mbe_i),
