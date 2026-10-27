@@ -11,7 +11,7 @@ OpenPiton behavior not represented in this checkout is identified as such.
 |---|---|---|
 | `wt_dcache_missunit` | `core/cache_subsystem/wt_dcache_missunit.sv:17` | Handles fills, remote invalidation returns, and the local flush scan. |
 | `wt_dcache_mem` | `core/cache_subsystem/wt_dcache_mem.sv:26` | Tag/valid and data SRAM access. |
-| `wt_dcache_ctrl` | `core/cache_subsystem/wt_dcache_ctrl.sv:16` | Load-side hit/miss controller; also contains the existing CA tag-set state. |
+| `wt_dcache_ctrl` | `core/cache_subsystem/wt_dcache_ctrl.sv:16` | Load-side hit/miss controller; CA tag ownership is tracked separately by `wt_dcache_ca_tag_set`. |
 | `wt_dcache_wbuffer` | `core/cache_subsystem/wt_dcache_wbuffer.sv:52` | Write-through store buffer and in-place cache-word update path. |
 | `wt_dcache` | `core/cache_subsystem/wt_dcache.sv:16` | Wires missunit, controllers, write buffer, and memory. |
 | OpenPiton L1.5 adapter | `core/cache_subsystem/wt_l15_adapter.sv:51` | Converts L15 responses to dcache return structs. |
@@ -198,7 +198,7 @@ must meet.
    implementation must show that the old CA bit is sampled before the
    subsequent clear or overwrite.
 
-## 6. Why keep CA state with tag/valid
+## 6. Conditional-access state and limits
 
 The L15 invalidation carries an index and way but no physical tag: the adapter
 forms `inv.idx` from address bits `[15:4]` plus four zero offset bits, the
@@ -206,10 +206,21 @@ destination struct is only index-width, and missunit consumes only the index
 slice plus `inv.way` (`wt_l15_adapter.sv:337-338`;
 wt_cache_subsystem.sv:80-85; wt_dcache_missunit.sv:427-439). A tag-set-register
 comparison keyed only by the invalidation address therefore cannot match the
-full physical line tag from this event, and a set-only comparison can
-overmatch other tags at that index. The per-way tag/valid entry already has
-the exact set/way SRAM access for invalidation, replacement, and flush; adding
-CA alongside those fields lets the same selected way reveal and update the
-old CA state without another tag comparison port (`wt_dcache_mem.sv:330-352`;
-wt_dcache_missunit.sv:427-448). This does widen tag SRAM data by one bit, but
-avoids making the revocation decision depend on an incomplete return address.
+full physical line tag from this event. The explicit tag set is core-local and
+stores committed physical cache-line addresses; it compares exact lines for
+addressed invalidations and conservatively invalidates all entries for a WT
+return that lacks a complete address. CREAD reservations remain pending by
+transaction ID until commit, so a flushed speculative CREAD does not leave a
+tag. A matching invalidation during that pending window is remembered and
+reported as failure to that CREAD before commit; if it later commits, the
+sticky revocation state is set as well. A full set causes revocation when the
+CREAD commits; entries are not silently evicted.
+
+This design does not provide cross-core coherence or atomic CWRITE. CWRITE is
+accepted only when its physical line is tagged and the sticky revocation state
+is clear; it still passes through the existing write buffer, so an invalidation
+can race with the memory write after that check. A custom cache protocol can
+feed complete line invalidations into the tag-set interface; protocols without
+a complete address must conservatively invalidate all local tags. Software
+must issue `UNTAG_ALL` during a context switch; traps and context changes do not
+clear the set automatically. Each hardware core has an independent local set.

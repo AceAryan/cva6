@@ -159,6 +159,7 @@ module store_buffer
   assign req_port_o.data_be = commit_queue_q[commit_read_pointer_q].be;
   assign req_port_o.data_size = commit_queue_q[commit_read_pointer_q].data_size;
   assign req_port_o.ca_op = commit_queue_q[commit_read_pointer_q].ca_op;
+  assign req_port_o.ca_id = '0;
 
   assign rvfi_mem_paddr_o = speculative_queue_q[speculative_read_pointer_q].address;
 
@@ -319,5 +320,4 @@ module store_buffer
   else $error("[Commit Queue] You are trying to commit a store although the buffer is full");
   //pragma translate_on
 endmodule
-
 

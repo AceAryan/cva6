@@ -168,6 +168,7 @@ module cva6_ptw
   // not a write
   assign req_port_o.cbo_op = ariane_pkg::CBO_NONE;
   assign req_port_o.ca_op = wt_cache_pkg::CA_NONE;
+  assign req_port_o.ca_id = '0;
 
   // -----------
   // TLB Update

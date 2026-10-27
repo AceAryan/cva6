@@ -230,6 +230,7 @@ module load_unit
                             (lsu_ctrl_i.operation == ariane_pkg::UNTAG_ALL) ?
                               wt_cache_pkg::CA_UNTAG_ALL :
                               wt_cache_pkg::CA_NONE;
+  assign req_port_o.ca_id = lsu_ctrl_i.trans_id;
   // compose the load buffer write data, control is handled in the FSM
   assign ldbuf_wdata = {lsu_ctrl_i.trans_id, lsu_ctrl_i.vaddr, lsu_ctrl_i.operation};
   // output address
@@ -626,14 +627,9 @@ module load_unit
           endian_data[31:0] = {<<8{shifted_data[31:0]}};
         end
         default: begin
-          endian_data[CVA6Cfg.XLEN-1:0] = {<<8{shifted_data[CVA6Cfg.XLEN-1:0]}};
-        end
-      endcase
-      // CA uses bit 0 as a software-visible failure indicator. The remaining
-      // bits retain the normal load value so successful cread remains useful.
-      if (ldbuf_rdata.operation == ariane_pkg::CREAD) begin
-        result_o[0] = ca_access_revoked_i;
-      end
+            endian_data[CVA6Cfg.XLEN-1:0] = {<<8{shifted_data[CVA6Cfg.XLEN-1:0]}};
+          end
+        endcase
     end
   end
 
@@ -691,6 +687,9 @@ module load_unit
         end
       end
     endcase
+    if (ldbuf_rdata.operation == ariane_pkg::CREAD) begin
+      result_o[0] = ca_access_revoked_i;
+    end
   end
   // end BIG ENDIAN CAPABLE result mux fast
 

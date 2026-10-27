@@ -22,6 +22,7 @@ module cva6
     parameter config_pkg::cva6_cfg_t CVA6Cfg = build_config_pkg::build_config(
         cva6_config_pkg::cva6_cfg
     ),
+    parameter int unsigned CA_TAG_SET_DEPTH = 8,
 
     // RVFI PROBES
     parameter type rvfi_probes_instr_t = `RVFI_PROBES_INSTR_T(CVA6Cfg),
@@ -218,6 +219,7 @@ module cva6
       cbo_t                                  cbo_op;
       // Sideband classification distinguishes CA requests from normal accesses.
       wt_cache_pkg::ca_op_t                  ca_op;
+      logic [CVA6Cfg.TRANS_ID_BITS-1:0]      ca_id;
     },
 
     localparam type dcache_req_o_t = struct packed {
@@ -389,6 +391,8 @@ module cva6
   logic eret;
   logic [CVA6Cfg.NrCommitPorts-1:0] commit_ack;
   logic [CVA6Cfg.NrCommitPorts-1:0] commit_macro_ack;
+  logic [CVA6Cfg.NrCommitPorts-1:0] ca_commit_valid;
+  logic [CVA6Cfg.NrCommitPorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] ca_commit_id;
   logic mbe;  // determines the data endian-ness of the processor
 
   localparam NumPorts = 4;
@@ -1201,6 +1205,14 @@ module cva6
   );
 
   assign commit_ack = commit_macro_ack & ~commit_drop_id_commit;
+  for (genvar ca_commit_idx = 0; ca_commit_idx < CVA6Cfg.NrCommitPorts; ca_commit_idx++) begin : gen_ca_commit
+    assign ca_commit_valid[ca_commit_idx] =
+        commit_ack[ca_commit_idx] &&
+        !commit_instr_id_commit[ca_commit_idx].ex.valid &&
+        (commit_instr_id_commit[ca_commit_idx].op inside
+         {ariane_pkg::CREAD, ariane_pkg::UNTAG_ONE, ariane_pkg::UNTAG_ALL});
+    assign ca_commit_id[ca_commit_idx] = commit_instr_id_commit[ca_commit_idx].trans_id;
+  end
 
   // ---------
   // CSR
@@ -1481,6 +1493,7 @@ module cva6
         .icache_rtrn_t(icache_rtrn_t),
         .dcache_req_i_t(dcache_req_i_t),
         .dcache_req_o_t(dcache_req_o_t),
+        .CA_TAG_SET_DEPTH(CA_TAG_SET_DEPTH),
         .NumPorts  (NumPorts),
         .noc_req_t (noc_req_t),
         .noc_resp_t(noc_resp_t)
@@ -1500,6 +1513,9 @@ module cva6
         .dcache_enable_i   (dcache_en_csr),
         .dcache_flush_i    (dcache_flush_ctrl_cache),
         .dcache_flush_ack_o(dcache_flush_ack_cache_ctrl),
+        .ca_flush_i        (flush_ctrl_ex | flush_commit),
+        .ca_commit_valid_i (ca_commit_valid),
+        .ca_commit_id_i    (ca_commit_id),
         // to commit stage
         .dcache_amo_req_i  (amo_req),
         .dcache_amo_resp_o (amo_resp),

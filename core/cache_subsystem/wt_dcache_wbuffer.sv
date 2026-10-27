@@ -69,6 +69,7 @@ module wt_dcache_wbuffer
     input dcache_req_i_t req_port_i,
     output dcache_req_o_t req_port_o,
     input logic ca_access_revoked_i,
+    input logic ca_cwrite_allowed_i,
     // interface to miss handler
     input logic miss_ack_i,
     output logic [CVA6Cfg.PLEN-1:0] miss_paddr_o,
@@ -506,7 +507,9 @@ module wt_dcache_wbuffer
   assign req_port_o.data_ruser  = '0;
   assign req_port_o.data_error = 1'b0;
   assign req_port_o.data_rid    = '0;
-  assign req_port_o.ca_access_revoked = ca_access_revoked_i;
+  assign req_port_o.ca_access_revoked =
+      (req_port_i.ca_op == wt_cache_pkg::CA_CWRITE) ? !ca_cwrite_allowed_i :
+                                                       ca_access_revoked_i;
 
   assign rd_hit_oh_d = rd_hit_oh_i;
 
@@ -577,7 +580,7 @@ module wt_dcache_wbuffer
     // A revoked conditional write is acknowledged without entering the
     // write buffer, allowing software to observe the failure status.
     if (req_port_i.data_req && rdy) begin
-      if (req_port_i.ca_op == wt_cache_pkg::CA_CWRITE && ca_access_revoked_i) begin
+      if (req_port_i.ca_op == wt_cache_pkg::CA_CWRITE && !ca_cwrite_allowed_i) begin
         // The request is completed without a memory-side write.
         req_port_o.data_gnt = 1'b1;
         wbuffer_wren = 1'b0;

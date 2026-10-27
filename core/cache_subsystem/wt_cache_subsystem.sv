@@ -33,6 +33,7 @@ module wt_cache_subsystem
     parameter type                   icache_req_t   = logic,
     parameter type                   icache_rtrn_t  = logic,
     parameter int unsigned           NumPorts       = 4,
+    parameter int unsigned           CA_TAG_SET_DEPTH = 8,
     parameter type                   noc_req_t      = logic,
     parameter type                   noc_resp_t     = logic
 ) (
@@ -53,6 +54,9 @@ module wt_cache_subsystem
     input logic dcache_enable_i,  // from CSR
     input logic dcache_flush_i,  // high until acknowledged
     output logic                           dcache_flush_ack_o,     // send a single cycle acknowledge signal when the cache is flushed
+    input logic ca_flush_i,
+    input logic [CVA6Cfg.NrCommitPorts-1:0] ca_commit_valid_i,
+    input logic [CVA6Cfg.NrCommitPorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] ca_commit_id_i,
     output logic dcache_miss_o,  // we missed on a ld/st
     // For Performance Counter
     output logic [NumPorts-1:0][CVA6Cfg.DCACHE_SET_ASSOC-1:0] miss_vld_bits_o,
@@ -111,8 +115,18 @@ module wt_cache_subsystem
 
   logic dcache_adapter_data_req, adapter_dcache_data_ack, adapter_dcache_rtrn_vld;
   logic adapter_dcache_rtrn_ready;
+  logic ca_invalidate_valid;
+  logic ca_invalidate_all;
   dcache_req_t  dcache_adapter;
   dcache_rtrn_t adapter_dcache;
+
+  assign ca_invalidate_all = adapter_dcache_rtrn_vld && adapter_dcache_rtrn_ready &&
+                             adapter_dcache.rtype == DCACHE_INV_REQ;
+`ifdef PITON_ARIANE
+  assign ca_invalidate_valid = ca_invalidate_all;
+`else
+  assign ca_invalidate_valid = ca_invalidate_all || (inval_valid_i && inval_ready_o);
+`endif
 
   cva6_icache #(
       // use ID 0 for icache reads
@@ -152,6 +166,8 @@ module wt_cache_subsystem
       .dcache_req_o_t(dcache_req_o_t),
       .dcache_req_t(dcache_req_t),
       .dcache_rtrn_t(dcache_rtrn_t),
+      .CA_TAG_SET_DEPTH(CA_TAG_SET_DEPTH),
+      .NumCommitPorts(CVA6Cfg.NrCommitPorts),
       // use ID 1 for dcache reads and amos. note that the writebuffer
       // uses all IDs up to DCACHE_MAX_TX-1 for write transactions.
       .RdAmoTxId(1)
@@ -161,6 +177,12 @@ module wt_cache_subsystem
       .enable_i        (dcache_enable_i),
       .flush_i         (dcache_flush_i),
       .flush_ack_o     (dcache_flush_ack_o),
+      .ca_flush_i      (ca_flush_i),
+      .ca_commit_valid_i(ca_commit_valid_i),
+      .ca_commit_id_i  (ca_commit_id_i),
+      .ca_invalidate_valid_i(ca_invalidate_valid),
+      .ca_invalidate_all_i(ca_invalidate_all),
+      .ca_invalidate_addr_i(inval_addr_i[CVA6Cfg.PLEN-1:0]),
       .miss_o          (dcache_miss_o),
       .wbuffer_empty_o (wbuffer_empty_o),
       .wbuffer_not_ni_o(wbuffer_not_ni_o),

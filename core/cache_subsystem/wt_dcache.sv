@@ -22,6 +22,8 @@ module wt_dcache
     parameter type dcache_req_o_t = logic,
     parameter type dcache_req_t = logic,
     parameter type dcache_rtrn_t = logic,
+    parameter int unsigned CA_TAG_SET_DEPTH = 8,
+    parameter int unsigned NumCommitPorts = CVA6Cfg.NrCommitPorts,
     parameter int unsigned NumPorts = 4,  // number of miss ports
     // ID to be used for read and AMO transactions.
     // note that the write buffer uses all IDs up to DCACHE_MAX_TX-1 for write transactions
@@ -33,6 +35,12 @@ module wt_dcache
     // Cache management
     input logic enable_i,  // from CSR
     input logic flush_i,  // high until acknowledged
+    input logic ca_flush_i,
+    input logic [NumCommitPorts-1:0] ca_commit_valid_i,
+    input logic [NumCommitPorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] ca_commit_id_i,
+    input logic ca_invalidate_valid_i,
+    input logic ca_invalidate_all_i,
+    input logic [CVA6Cfg.PLEN-1:0] ca_invalidate_addr_i,
     output logic flush_ack_o,  // send a single cycle acknowledge signal when the cache is flushed
     output logic miss_o,  // we missed on a ld/st
     output logic wbuffer_empty_o,
@@ -85,7 +93,6 @@ module wt_dcache
   logic     [CVA6Cfg.DCACHE_USER_LINE_WIDTH-1:0]                                  wr_cl_user;
   logic     [   CVA6Cfg.DCACHE_LINE_WIDTH/8-1:0]                                  wr_cl_data_be;
   logic     [      CVA6Cfg.DCACHE_SET_ASSOC-1:0]                                  wr_vld_bits;
-  logic     [      CVA6Cfg.DCACHE_SET_ASSOC-1:0]                                  wr_ca_tag_bits;
   logic     [      CVA6Cfg.DCACHE_SET_ASSOC-1:0]                                  wr_req;
   logic                                                                           wr_ack;
   logic     [           DCACHE_CL_IDX_WIDTH-1:0]                                  wr_idx;
@@ -99,7 +106,6 @@ module wt_dcache
   logic     [                      NumPorts-1:0]                                  miss_ack;
   logic     [                      NumPorts-1:0]                                  miss_nc;
   logic     [                      NumPorts-1:0]                                  miss_we;
-  logic     [                      NumPorts-1:0]                                  miss_ca;
   logic     [                      NumPorts-1:0][               CVA6Cfg.XLEN-1:0] miss_wdata;
   logic     [                      NumPorts-1:0][  CVA6Cfg.DCACHE_USER_WIDTH-1:0] miss_wuser;
   logic     [                      NumPorts-1:0][               CVA6Cfg.PLEN-1:0] miss_paddr;
@@ -129,56 +135,40 @@ module wt_dcache
   // wbuffer <-> memory
   wbuffer_t [     CVA6Cfg.WtDcacheWbufDepth-1:0]                                  wbuffer_data;
 
-  // Scalar signals classify CA requests and expose controller state.
-  logic                                 ca_access_revoked;
-  logic [NumPorts-2:0]                  ca_meta_req_ports;
-  logic [NumPorts-2:0]                  ca_meta_all_ports;
-  logic [NumPorts-2:0]                  ca_meta_set_ports;
-  logic [NumPorts-2:0][DCACHE_CL_IDX_WIDTH-1:0] ca_meta_idx_ports;
-  logic [NumPorts-2:0][CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_meta_tag_ports;
-  logic [NumPorts-2:0]                  ca_meta_ready_ports;
-  logic                                 ca_meta_req;
-  logic                                 ca_meta_all;
-  logic                                 ca_meta_set;
-  logic [DCACHE_CL_IDX_WIDTH-1:0]       ca_meta_idx;
-  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0]  ca_meta_tag;
-  logic                                 ca_meta_ready;
-  logic                                 ca_departed;
+  logic ca_access_revoked;
+  logic ca_cwrite_allowed;
+  logic [(1 << CVA6Cfg.TRANS_ID_BITS)-1:0] ca_query_failed;
   logic                                 meta_busy;
   logic                                 rd_blocked;
   assign rd_blocked = wr_cl_vld | meta_busy;
 
-  always_comb begin : p_ca_meta_arb
-    logic found;
-    ca_meta_req = 1'b0;
-    ca_meta_all = 1'b0;
-    ca_meta_set = 1'b0;
-    ca_meta_idx = '0;
-    ca_meta_tag = '0;
-    ca_meta_ready_ports = '0;
-    found = 1'b0;
-    for (int port_idx = 0; port_idx < NumPorts - 1; port_idx++) begin
-      if (!found && ca_meta_req_ports[port_idx]) begin
-        ca_meta_req = 1'b1;
-        ca_meta_all = ca_meta_all_ports[port_idx];
-        ca_meta_set = ca_meta_set_ports[port_idx];
-        ca_meta_idx = ca_meta_idx_ports[port_idx];
-        ca_meta_tag = ca_meta_tag_ports[port_idx];
-        ca_meta_ready_ports[port_idx] = ca_meta_ready;
-        found = 1'b1;
-      end
-    end
-  end
-
-  always_ff @(posedge clk_i or negedge rst_ni) begin : p_ca_revoked
-    if (!rst_ni) begin
-      ca_access_revoked <= 1'b0;
-    end else if (ca_meta_req && ca_meta_ready && ca_meta_all) begin
-      ca_access_revoked <= 1'b0;
-    end else if (ca_departed) begin
-      ca_access_revoked <= 1'b1;
-    end
-  end
+  wt_dcache_ca_tag_set #(
+      .DEPTH(CA_TAG_SET_DEPTH),
+      .ADDR_WIDTH(CVA6Cfg.PLEN),
+      .LINE_OFFSET_BITS(CVA6Cfg.DCACHE_OFFSET_WIDTH),
+      .ID_WIDTH(CVA6Cfg.TRANS_ID_BITS),
+      .NUM_COMMIT_PORTS(NumCommitPorts)
+  ) i_ca_tag_set (
+      .clk_i(clk_i),
+      .rst_ni(rst_ni),
+      .flush_i(ca_flush_i),
+      .issue_valid_i(req_ports_o[1].data_gnt &&
+                     (req_ports_i[1].ca_op inside
+                      {CA_CREAD, CA_UNTAG_ONE, CA_UNTAG_ALL})),
+      .issue_op_i(req_ports_i[1].ca_op),
+      .issue_id_i(req_ports_i[1].ca_id),
+      .issue_addr_i({req_ports_i[1].address_tag, req_ports_i[1].address_index}),
+      .commit_valid_i(ca_commit_valid_i),
+      .commit_id_i(ca_commit_id_i),
+      .invalidate_valid_i(ca_invalidate_valid_i),
+      .invalidate_all_i(ca_invalidate_all_i),
+      .invalidate_addr_i(ca_invalidate_addr_i),
+      .cwrite_addr_i({req_ports_i[NumPorts-1].address_tag,
+                      req_ports_i[NumPorts-1].address_index}),
+      .access_revoked_o(ca_access_revoked),
+      .cwrite_allowed_o(ca_cwrite_allowed),
+      .query_failed_o(ca_query_failed)
+  );
 
   ///////////////////////////////////////////////////////
   // miss handling unit
@@ -209,7 +199,7 @@ module wt_dcache
       .miss_ack_o     (miss_ack),
       .miss_nc_i      (miss_nc),
       .miss_we_i      (miss_we),
-      .miss_ca_i      (miss_ca),
+      .miss_ca_i      ('0),
       .miss_wdata_i   (miss_wdata),
       .miss_wuser_i   (miss_wuser),
       .miss_paddr_i   (miss_paddr),
@@ -233,7 +223,7 @@ module wt_dcache
       .wr_cl_user_o   (wr_cl_user),
       .wr_cl_data_be_o(wr_cl_data_be),
       .wr_vld_bits_o  (wr_vld_bits),
-      .wr_ca_tag_bits_o(wr_ca_tag_bits),
+      .wr_ca_tag_bits_o(),
       .wr_cl_ready_i  (wr_cl_ready),
       // memory interface
       .mem_rtrn_vld_i (mem_rtrn_vld_i),
@@ -266,6 +256,7 @@ module wt_dcache
           // reqs from core
           .req_port_i     (req_ports_i[k]),
           .req_port_o     (req_ports_o[k]),
+          .ca_pending_failed_i((k == 1) ? ca_query_failed : '0),
           // miss interface
           .miss_req_o     (miss_req[k]),
           .miss_ack_i     (miss_ack[k]),
@@ -292,18 +283,6 @@ module wt_dcache
           .rd_user_i      (rd_user),
           .rd_vld_bits_i  (rd_vld_bits),
           .rd_hit_oh_i    (rd_hit_oh),
-          // The CA interface is attached to the load-side controller instance.
-          .ca_cread_i          (req_ports_i[k].ca_op == wt_cache_pkg::CA_CREAD),
-          .ca_cwrite_i         (req_ports_i[k].ca_op == wt_cache_pkg::CA_CWRITE),
-          .ca_untag_one_i      (req_ports_i[k].ca_op == wt_cache_pkg::CA_UNTAG_ONE),
-          .ca_untag_all_i      (req_ports_i[k].ca_op == wt_cache_pkg::CA_UNTAG_ALL),
-          .miss_ca_o          (miss_ca[k]),
-          .ca_meta_req_o      (ca_meta_req_ports[k]),
-          .ca_meta_all_o      (ca_meta_all_ports[k]),
-          .ca_meta_set_o      (ca_meta_set_ports[k]),
-          .ca_meta_idx_o      (ca_meta_idx_ports[k]),
-          .ca_meta_tag_o      (ca_meta_tag_ports[k]),
-          .ca_meta_ready_i    (ca_meta_ready_ports[k]),
           .ca_access_revoked_i(ca_access_revoked)
       );
     end else begin
@@ -311,12 +290,6 @@ module wt_dcache
       assign req_ports_o[k] = '0;
       assign miss_req[k] = 1'b0;
       assign miss_we[k] = 1'b0;
-      assign miss_ca[k] = 1'b0;
-      assign ca_meta_req_ports[k] = 1'b0;
-      assign ca_meta_all_ports[k] = 1'b0;
-      assign ca_meta_set_ports[k] = 1'b0;
-      assign ca_meta_idx_ports[k] = '0;
-      assign ca_meta_tag_ports[k] = '0;
       assign miss_wdata[k] = {{CVA6Cfg.XLEN}{1'b0}};
       assign miss_wuser[k] = {{CVA6Cfg.DCACHE_USER_WIDTH}{1'b0}};
       assign miss_vld_bits_o[k] = {{CVA6Cfg.DCACHE_SET_ASSOC}{1'b0}};
@@ -338,7 +311,6 @@ module wt_dcache
 
   // set read port to low priority
   assign rd_prio[NumPorts-1] = 1'b0;
-  assign miss_ca[NumPorts-1] = 1'b0;
 
   wt_dcache_wbuffer #(
       .CVA6Cfg(CVA6Cfg),
@@ -358,6 +330,7 @@ module wt_dcache
       .req_port_i     (req_ports_i[NumPorts-1]),
       .req_port_o     (req_ports_o[NumPorts-1]),
       .ca_access_revoked_i(ca_access_revoked),
+      .ca_cwrite_allowed_i(ca_cwrite_allowed),
       // miss unit interface
       .miss_req_o     (miss_req[NumPorts-1]),
       .miss_ack_i     (miss_ack[NumPorts-1]),
@@ -433,16 +406,16 @@ module wt_dcache
       .wr_cl_user_i   (wr_cl_user),
       .wr_cl_data_be_i(wr_cl_data_be),
       .wr_vld_bits_i  (wr_vld_bits),
-      .wr_ca_tag_bits_i(wr_ca_tag_bits),
+      .wr_ca_tag_bits_i('0),
       .wr_cl_ready_o (wr_cl_ready),
-      .ca_meta_req_i (ca_meta_req),
-      .ca_meta_all_i (ca_meta_all),
-      .ca_meta_set_i (ca_meta_set),
-      .ca_meta_idx_i (ca_meta_idx),
-      .ca_meta_tag_i (ca_meta_tag),
-      .ca_meta_ready_o(ca_meta_ready),
+      .ca_meta_req_i (1'b0),
+      .ca_meta_all_i (1'b0),
+      .ca_meta_set_i (1'b0),
+      .ca_meta_idx_i ('0),
+      .ca_meta_tag_i ('0),
+      .ca_meta_ready_o(),
       .meta_busy_o    (meta_busy),
-      .ca_departed_o (ca_departed),
+      .ca_departed_o (),
       // single word write port
       .wr_req_i       (wr_req),
       .wr_ack_o       (wr_ack),
