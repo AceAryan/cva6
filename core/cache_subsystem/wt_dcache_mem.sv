@@ -71,6 +71,14 @@ module wt_dcache_mem
     input logic [           DCACHE_CL_IDX_WIDTH-1:0] ca_meta_idx_i,
     input logic [      CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_meta_tag_i,
     output logic                                      ca_meta_ready_o,
+    input logic                                      ca_meta_query_req_i,
+    input logic [           DCACHE_CL_IDX_WIDTH-1:0] ca_meta_query_idx_i,
+    input logic [      CVA6Cfg.DCACHE_TAG_WIDTH-1:0] ca_meta_query_tag_i,
+    output logic                                      ca_meta_query_ready_o,
+    output logic                                      ca_meta_query_valid_o,
+    output logic                                      ca_meta_query_match_o,
+    output logic                                      ca_meta_query_ca_o,
+    output logic [$clog2(CVA6Cfg.DCACHE_SET_ASSOC)-1:0] ca_meta_query_way_o,
     output logic                                      meta_busy_o,
     output logic                                      ca_departed_o,
 
@@ -136,7 +144,8 @@ module wt_dcache_mem
     META_CA_READ,
     META_WRITE,
     META_ALL_READ,
-    META_ALL_WRITE
+    META_ALL_WRITE,
+    META_QUERY
   } meta_state_e;
   meta_state_e meta_state_q, meta_state_d;
   logic [DCACHE_CL_IDX_WIDTH-1:0] meta_idx_q, meta_idx_d;
@@ -147,7 +156,8 @@ module wt_dcache_mem
   logic meta_line_write_q, meta_line_write_d;
   logic meta_ca_set_q, meta_ca_set_d;
   logic [DCACHE_CL_IDX_WIDTH-1:0] meta_all_idx_q, meta_all_idx_d;
-  logic wr_cl_accept, meta_start_line, meta_start_ca, meta_busy;
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] meta_query_tag_q, meta_query_tag_d;
+  logic wr_cl_accept, meta_start_line, meta_start_ca, meta_start_query, meta_busy;
 
   logic [$clog2(NumPorts)-1:0] vld_sel_d, vld_sel_q;
 
@@ -187,9 +197,11 @@ module wt_dcache_mem
 
   assign wr_cl_ready_o = meta_state_q == META_IDLE;
   assign ca_meta_ready_o = (meta_state_q == META_IDLE) & ~wr_cl_vld_i;
+  assign ca_meta_query_ready_o = (meta_state_q == META_IDLE) & ~wr_cl_vld_i & ~ca_meta_req_i;
   assign wr_cl_accept = wr_cl_vld_i & wr_cl_ready_o;
   assign meta_start_line = wr_cl_accept;
   assign meta_start_ca = ca_meta_req_i & ca_meta_ready_o;
+  assign meta_start_query = ca_meta_query_req_i & ca_meta_query_ready_o;
   assign meta_busy = meta_state_q != META_IDLE;
   assign meta_busy_o = meta_busy;
   assign rd_tag        = rd_tag_i[vld_sel_q];  //delayed by one cycle
@@ -233,6 +245,9 @@ module wt_dcache_mem
         end else if (meta_start_ca && !ca_meta_all_i) begin
           vld_req = '1;
           vld_addr = ca_meta_idx_i;
+        end else if (meta_start_query) begin
+          vld_req = '1;
+          vld_addr = ca_meta_query_idx_i;
         end else if (rd_acked) begin
           vld_req = '1;
           vld_addr = rd_idx_i[vld_sel_d];
@@ -275,6 +290,22 @@ module wt_dcache_mem
     end
   end
 
+  always_comb begin : p_meta_query_response
+    ca_meta_query_valid_o = meta_state_q == META_QUERY;
+    ca_meta_query_match_o = 1'b0;
+    ca_meta_query_ca_o = 1'b0;
+    ca_meta_query_way_o = '0;
+    for (int way = 0; way < CVA6Cfg.DCACHE_SET_ASSOC; way++) begin
+      if (!ca_meta_query_match_o &&
+          vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH+1] &&
+          tag_rdata[way] == meta_query_tag_q) begin
+        ca_meta_query_match_o = 1'b1;
+        ca_meta_query_ca_o = vld_tag_rdata[way][CVA6Cfg.DCACHE_TAG_WIDTH];
+        ca_meta_query_way_o = way;
+      end
+    end
+  end
+
   always_comb begin : p_meta_state
     meta_state_d = meta_state_q;
     meta_idx_d = meta_idx_q;
@@ -285,6 +316,7 @@ module wt_dcache_mem
     meta_line_write_d = meta_line_write_q;
     meta_ca_set_d = meta_ca_set_q;
     meta_all_idx_d = meta_all_idx_q;
+    meta_query_tag_d = meta_query_tag_q;
 
     case (meta_state_q)
       META_IDLE: begin
@@ -308,6 +340,9 @@ module wt_dcache_mem
           end else begin
             meta_state_d = META_CA_READ;
           end
+        end else if (meta_start_query) begin
+          meta_query_tag_d = ca_meta_query_tag_i;
+          meta_state_d = META_QUERY;
         end
       end
       META_LINE_READ, META_CA_READ: meta_state_d = META_WRITE;
@@ -321,6 +356,7 @@ module wt_dcache_mem
           meta_state_d = META_ALL_READ;
         end
       end
+      META_QUERY: meta_state_d = META_IDLE;
       default: meta_state_d = META_IDLE;
     endcase
   end
@@ -343,13 +379,13 @@ module wt_dcache_mem
       .req_i  (rd_req_masked),
       .gnt_o  (rd_ack_o),
       .data_i ('0),
-      .gnt_i  (~wr_cl_vld_i & ~meta_busy & ~ca_meta_req_i),
+      .gnt_i  (~wr_cl_vld_i & ~meta_busy & ~ca_meta_req_i & ~ca_meta_query_req_i),
       .req_o  (rd_req),
       .data_o (),
       .idx_o  (vld_sel_d)
   );
 
-  assign rd_acked = rd_req & ~wr_cl_vld_i & ~meta_busy & ~ca_meta_req_i;
+  assign rd_acked = rd_req & ~wr_cl_vld_i & ~meta_busy & ~ca_meta_req_i & ~ca_meta_query_req_i;
 
   always_comb begin : p_bank_req
     bank_req = '0;
@@ -530,6 +566,7 @@ module wt_dcache_mem
       meta_line_write_q <= 1'b0;
       meta_ca_set_q <= 1'b0;
       meta_all_idx_q <= '0;
+      meta_query_tag_q <= '0;
     end else begin
       bank_idx_q <= bank_idx_d;
       bank_off_q <= bank_off_d;
@@ -544,6 +581,7 @@ module wt_dcache_mem
       meta_line_write_q <= meta_line_write_d;
       meta_ca_set_q <= meta_ca_set_d;
       meta_all_idx_q <= meta_all_idx_d;
+      meta_query_tag_q <= meta_query_tag_d;
     end
   end
 

@@ -25,7 +25,9 @@ module miss_handler
     parameter type                   axi_req_t    = logic,
     parameter type                   axi_rsp_t    = logic,
     parameter type                   cache_line_t = logic,
-    parameter type                   cl_be_t      = logic
+    parameter type                   cl_be_t      = logic,
+    // cycles an LR keeps its tenure waiting for the matching SC
+    parameter int unsigned           LrHoldCycles = 64
 ) (
     input logic clk_i,
     input logic rst_ni,
@@ -65,7 +67,15 @@ module miss_handler
     output cache_line_t data_o,
     output cl_be_t be_o,
     input cache_line_t [CVA6Cfg.DCACHE_SET_ASSOC-1:0] data_i,
-    output logic we_o
+    output logic we_o,
+    // Coherence bus: request a tenure before touching memory for a cacheable line
+    output cc_req_t cc_req_o,
+    input logic cc_gnt_i,  // single-cycle, only while cc_req_o.valid
+    output logic cc_done_o,  // single-cycle, ends the tenure
+    // Snoops from the coherence bus
+    input cc_snoop_t snoop_i,  // held until snoop_ready_o
+    output logic snoop_ready_o,
+    output logic snoop_ack_o  // single-cycle, line state updated and write-back complete
 );
 
   // Three MSHR ports + AMO port
@@ -92,7 +102,7 @@ module miss_handler
   endfunction
 
   // FSM states
-  enum logic [3:0] {
+  typedef enum logic [4:0] {
     IDLE,                // 0
     FLUSHING,            // 1
     FLUSH,               // 2
@@ -106,9 +116,40 @@ module miss_handler
     SAVE_CACHELINE,      // A
     INIT,                // B
     AMO_REQ,             // C
-    AMO_WAIT_RESP        // D
-  }
-      state_d, state_q;
+    AMO_WAIT_RESP,       // D
+    BUS_REQ,             // E  wait for a coherence tenure before serving the MSHR
+    FLUSH_BUS_REQ,       // F  wait for a tenure before writing back a dirty line on flush
+    FLUSH_WB_WAIT,       // 10 wait for the flush write-back response, then end the tenure
+    SNOOP_REQ,           // 11 read the snooped set
+    SNOOP_CHECK,         // 12 look up the snooped line
+    SNOOP_WB,            // 13 write back a dirty owned line
+    SNOOP_WB_WAIT,       // 14 wait for the snoop write-back response
+    SNOOP_UPDATE,        // 15 downgrade/invalidate the line and acknowledge
+    AMO_BUS_REQ,         // 16 wait for a GetM tenure for a cacheable AMO
+    AMO_LOOKUP,          // 17 read the AMO set
+    AMO_EXEC,            // 18 read-modify-write the M line, or fetch it first
+    LR_HOLD              // 19 keep the LR tenure for the SC (forward progress)
+  } state_e;
+  state_e state_d, state_q;
+
+  // Coherence
+  logic bus_held_d, bus_held_q;  // we own a coherence tenure
+  cc_snoop_t snoop_d, snoop_q;
+  state_e snoop_ret_d, snoop_ret_q;  // where to resume after serving a snoop
+  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] snoop_way_d, snoop_way_q;
+  logic snoop_accept;
+  logic snoop_busy;
+
+  // AMOs on cacheable addresses execute in the cache, on a line held in M
+  logic amo_cacheable;
+  logic amo_mshr_d, amo_mshr_q;  // the MSHR serves an AMO, not a port
+  logic resv_valid_d, resv_valid_q;  // LR reservation
+  logic [55:CVA6Cfg.DCACHE_OFFSET_WIDTH] resv_addr_d, resv_addr_q;
+  logic [$clog2(LrHoldCycles+1)-1:0] lr_hold_d, lr_hold_q;
+  logic any_miss_req;
+  logic [63:0] amo_old, amo_operand_a_ext, amo_operand_b_ext, amo_new, amo_ret;
+  logic [CVA6Cfg.DCACHE_LINE_WIDTH-1:0] amo_line;
+  logic [$clog2(CVA6Cfg.DCACHE_LINE_WIDTH)-1:0] amo_bit_off;  // offset of the 64b word
 
   // Registers
   mshr_t mshr_d, mshr_q;
@@ -167,12 +208,29 @@ module miss_handler
   // ------------------------------
   // Cache Management
   // ------------------------------
+  // Snoops are only taken in states where the cache holds no tenure and no
+  // half-done line operation. All of them are either idle or waiting for the
+  // bus, so a snoop can always make progress while we wait (no deadlock).
+  assign snoop_ready_o = !bus_held_q &&
+      (state_q inside {IDLE, BUS_REQ, FLUSH_BUS_REQ, FLUSH_REQ_STATUS, AMO_BUS_REQ});
+  assign snoop_accept = snoop_i.valid && snoop_ready_o;
+  assign snoop_busy = snoop_accept ||
+      (state_q inside {SNOOP_REQ, SNOOP_CHECK, SNOOP_WB, SNOOP_WB_WAIT, SNOOP_UPDATE});
+
   always_comb begin : cache_management
-    automatic logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] evict_way, valid_way;
+    automatic logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] evict_way, valid_way, present_way, snoop_hit_way;
+    automatic logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] owned_way;
+    automatic logic sc_ok;
 
     for (int unsigned i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin
       evict_way[i] = data_i[i].valid & data_i[i].dirty;
       valid_way[i] = data_i[i].valid;
+      // the MSHR line is already present, e.g. a store upgrading an S line
+      present_way[i] = data_i[i].valid &&
+          data_i[i].tag == mshr_q.addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_INDEX_WIDTH];
+      owned_way[i] = data_i[i].owned;
+      snoop_hit_way[i] = data_i[i].valid &&
+          data_i[i].tag == snoop_q.addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_INDEX_WIDTH];
     end
     // ----------------------
     // Default Assignments
@@ -219,7 +277,7 @@ module miss_handler
     evict_cl_d                  = evict_cl_q;
     mshr_d                      = mshr_q;
     // communicate to the requester which unit we are currently serving
-    active_serving_o[mshr_q.id] = mshr_q.valid;
+    active_serving_o[mshr_q.id] = mshr_q.valid && !amo_mshr_q;
     // AMOs
     amo_resp_o.ack              = 1'b0;
     amo_resp_o.result           = '0;
@@ -227,32 +285,62 @@ module miss_handler
 
     halfword                    = '0;
     cl_offset                   = '0;
+    // coherence
+    cc_req_o                    = '0;
+    cc_done_o                   = 1'b0;
+    snoop_ack_o                 = 1'b0;
+    bus_held_d                  = bus_held_q;
+    snoop_d                     = snoop_q;
+    snoop_ret_d                 = snoop_ret_q;
+    snoop_way_d                 = snoop_way_q;
+    amo_mshr_d                  = amo_mshr_q;
+    resv_valid_d                = resv_valid_q;
+    resv_addr_d                 = resv_addr_q;
+    lr_hold_d                   = lr_hold_q;
+    any_miss_req                = |(miss_req_valid & ~miss_req_bypass);
+    sc_ok = resv_valid_q && resv_addr_q == mshr_q.addr[55:CVA6Cfg.DCACHE_OFFSET_WIDTH];
 
     case (state_q)
 
       IDLE: begin
         // lowest priority are AMOs, wait until everything else is served before going for the AMOs
         if (amo_req_i.req && !busy_i) begin
-          // 1. Flush the cache
-          state_d = FLUSH_REQ_STATUS;
-          serve_amo_d = 1'b1;
-          cnt_d = '0;
+          if (amo_cacheable) begin
+            // execute in the cache once the line is held in M; the MSHR holds
+            // off the ports from the line meanwhile
+            state_d      = AMO_BUS_REQ;
+            mshr_d.valid = 1'b1;
+            mshr_d.we    = 1'b1;
+            mshr_d.id    = '0;
+            mshr_d.addr  = amo_req_i.operand_a[55:0];
+            mshr_d.wdata = '0;
+            mshr_d.be    = '0;
+            amo_mshr_d   = 1'b1;
+          end else begin
+            // 1. Flush the cache
+            state_d = FLUSH_REQ_STATUS;
+            serve_amo_d = 1'b1;
+            cnt_d = '0;
+          end
         end
         // check if we want to flush and can flush e.g.: we are not busy anymore
         // TODO: Check that the busy flag is indeed needed
         if (flush_i && !busy_i) begin
-          state_d = FLUSH_REQ_STATUS;
-          cnt_d   = '0;
+          state_d    = FLUSH_REQ_STATUS;
+          cnt_d      = '0;
+          mshr_d     = mshr_q;
+          amo_mshr_d = 1'b0;
         end
 
         // check if one of the state machines missed
         for (int unsigned i = 0; i < NR_PORTS; i++) begin
           // here comes the refill portion of code
           if (miss_req_valid[i] && !miss_req_bypass[i]) begin
-            state_d = MISS;
             // we are taking another request so don't take the AMO
             serve_amo_d = 1'b0;
-            // save to MSHR
+            // save to MSHR, the line is served once we own a coherence tenure
+            state_d = BUS_REQ;
+            amo_mshr_d = 1'b0;
             mshr_d.valid = 1'b1;
             mshr_d.we = miss_req_we[i];
             mshr_d.id = i;
@@ -261,6 +349,34 @@ module miss_handler
             mshr_d.be = miss_req_be[i];
             break;
           end
+        end
+
+        // snoops take priority over anything started from here; whatever was
+        // picked above is picked again once the snoop is served
+        if (snoop_accept) begin
+          state_d     = SNOOP_REQ;
+          snoop_ret_d = IDLE;
+          serve_amo_d = serve_amo_q;
+          cnt_d       = cnt_q;
+          mshr_d      = mshr_q;
+          amo_mshr_d  = amo_mshr_q;
+        end
+      end
+
+      // ~> wait for the coherence tenure of the MSHR line
+      BUS_REQ: begin
+        cc_req_o.valid = 1'b1;
+        cc_req_o.req_type = mshr_q.we ? CC_GETM : CC_GETS;
+        cc_req_o.addr = {
+          mshr_q.addr[55:CVA6Cfg.DCACHE_OFFSET_WIDTH], {{CVA6Cfg.DCACHE_OFFSET_WIDTH} {1'b0}}
+        };
+        if (cc_gnt_i) begin
+          bus_held_d = 1'b1;
+          state_d    = MISS;
+        end else if (snoop_accept) begin
+          // the line state is read again in MISS, after the snoop
+          state_d     = SNOOP_REQ;
+          snoop_ret_d = BUS_REQ;
         end
       end
 
@@ -276,10 +392,24 @@ module miss_handler
 
       // ~> second miss cycle
       MISS_REPL: begin
-        // if all are valid we need to evict one, pseudo random from LFSR
-        if (&valid_way) begin
+        // the line is already here (S, upgrading to M): refill it in place so
+        // the set never holds the same tag twice
+        if (|present_way) begin
+          evict_way_d = present_way;
+          if (data_i[one_hot_to_bin(present_way)].dirty) begin
+            state_d = WB_CACHELINE_MISS;
+            evict_cl_d.tag = data_i[one_hot_to_bin(present_way)].tag;
+            evict_cl_d.data = data_i[one_hot_to_bin(present_way)].data;
+            cnt_d = mshr_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
+          end else state_d = REQ_CACHELINE;
+          // if all are valid we need to evict one, pseudo random from LFSR
+        end else if (&valid_way) begin
           lfsr_enable = 1'b1;
           evict_way_d = lfsr_oh;
+          // losing the reserved line loses the reservation
+          if ({data_i[lfsr_bin].tag, mshr_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH]} ==
+              resv_addr_q)
+            resv_valid_d = 1'b0;
           // do we need to write back the cache line?
           if (data_i[lfsr_bin].dirty) begin
             state_d = WB_CACHELINE_MISS;
@@ -303,7 +433,7 @@ module miss_handler
 
         if (gnt_miss_fsm) begin
           state_d = SAVE_CACHELINE;
-          miss_gnt_o[mshr_q.id] = 1'b1;
+          miss_gnt_o[mshr_q.id] = !amo_mshr_q;
         end
       end
 
@@ -323,6 +453,8 @@ module miss_handler
           data_o.data = data_miss_fsm;
           data_o.valid = 1'b1;
           data_o.dirty = 1'b0;
+          // a GetM fill is M, a GetS fill is S
+          data_o.owned = mshr_q.we;
 
           // is this a write?
           if (mshr_q.we) begin
@@ -331,13 +463,21 @@ module miss_handler
               // check if we really want to write the corresponding byte
               if (mshr_q.be[i]) data_o.data[(cl_offset+i*8)+:8] = mshr_q.wdata[i];
             end
-            // its immediately dirty if we write
-            data_o.dirty = 1'b1;
+            // its immediately dirty if we write (an AMO fetch writes nothing yet)
+            data_o.dirty = |mshr_q.be;
           end
-          // reset MSHR
-          mshr_d.valid = 1'b0;
-          // go back to idle
-          state_d = IDLE;
+          if (amo_mshr_q) begin
+            // the AMO line is now M, execute under the same tenure
+            state_d = AMO_LOOKUP;
+          end else begin
+            // reset MSHR
+            mshr_d.valid = 1'b0;
+            // the read completed after any victim write-back, end the tenure
+            cc_done_o = 1'b1;
+            bus_held_d = 1'b0;
+            // go back to idle
+            state_d = IDLE;
+          end
         end
       end
 
@@ -367,7 +507,35 @@ module miss_handler
           // invalidate
           be_o.vldrty  = evict_way_q;
           // go back to handling the miss or flushing, depending on where we came from
-          state_d      = (state_q == WB_CACHELINE_MISS) ? MISS : FLUSH_REQ_STATUS;
+          state_d      = (state_q == WB_CACHELINE_MISS) ? MISS : FLUSH_WB_WAIT;
+        end
+      end
+
+      // ~> the flushed line must be in memory before anybody else may read it
+      FLUSH_WB_WAIT: begin
+        if (valid_miss_fsm) begin
+          cc_done_o  = 1'b1;
+          bus_held_d = 1'b0;
+          state_d    = FLUSH_REQ_STATUS;
+        end
+      end
+
+      // ~> wait for a tenure, then look at the set again as a snoop may have
+      //    cleaned the line meanwhile
+      FLUSH_BUS_REQ: begin
+        cc_req_o.valid = 1'b1;
+        cc_req_o.req_type = CC_PUTM;
+        cc_req_o.addr = {
+          evict_cl_q.tag,
+          cnt_q[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH],
+          {{CVA6Cfg.DCACHE_OFFSET_WIDTH} {1'b0}}
+        };
+        if (cc_gnt_i) begin
+          bus_held_d = 1'b1;
+          state_d    = FLUSH_REQ_STATUS;
+        end else if (snoop_accept) begin
+          state_d     = SNOOP_REQ;
+          snoop_ret_d = FLUSH_REQ_STATUS;
         end
       end
 
@@ -378,7 +546,16 @@ module miss_handler
       FLUSH_REQ_STATUS: begin
         req_o   = '1;
         addr_o  = cnt_q;
+        // the set is about to be written back and invalidated
+        if (cnt_q[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] ==
+            resv_addr_q[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH])
+          resv_valid_d = 1'b0;
         state_d = FLUSHING;
+        if (snoop_accept) begin
+          req_o       = '0;
+          state_d     = SNOOP_REQ;
+          snoop_ret_d = FLUSH_REQ_STATUS;
+        end
       end
 
       FLUSHING: begin
@@ -388,9 +565,14 @@ module miss_handler
           // evict cache line, look for the first cache-line which is dirty
           evict_way_d = get_victim_cl(evict_way);
           evict_cl_d  = data_i[one_hot_to_bin(evict_way)];
-          state_d     = WB_CACHELINE_FLUSH;
+          state_d     = bus_held_q ? WB_CACHELINE_FLUSH : FLUSH_BUS_REQ;
           // not dirty ~> increment and continue
         end else begin
+          // a snoop cleaned the line while we waited for the tenure
+          if (bus_held_q) begin
+            cc_done_o  = 1'b1;
+            bus_held_d = 1'b0;
+          end
           // increment and re-request
           cnt_d       = cnt_q + (1'b1 << CVA6Cfg.DCACHE_OFFSET_WIDTH);
           state_d     = FLUSH_REQ_STATUS;
@@ -496,11 +678,213 @@ module miss_handler
         end
       end
 
+      // ----------------------
+      // Snoops
+      // ----------------------
+      // ~> read the snooped set
+      SNOOP_REQ: begin
+        req_o   = '1;
+        addr_o  = snoop_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
+        state_d = SNOOP_CHECK;
+      end
+
+      SNOOP_CHECK: begin
+        snoop_way_d = snoop_hit_way;
+        evict_cl_d  = data_i[one_hot_to_bin(snoop_hit_way)];
+        if (!(|snoop_hit_way)) begin
+          // I: nothing to do
+          snoop_ack_o = 1'b1;
+          state_d     = snoop_ret_q;
+        end else if (data_i[one_hot_to_bin(snoop_hit_way)].dirty) begin
+          state_d = SNOOP_WB;
+        end else begin
+          state_d = SNOOP_UPDATE;
+        end
+      end
+
+      // ~> M and dirty: memory must be up to date before the requester reads it
+      SNOOP_WB: begin
+        req_fsm_miss_valid = 1'b1;
+        req_fsm_miss_addr  = snoop_q.addr;
+        req_fsm_miss_be    = '1;
+        req_fsm_miss_we    = 1'b1;
+        req_fsm_miss_wdata = evict_cl_q.data;
+        if (gnt_miss_fsm) state_d = SNOOP_WB_WAIT;
+      end
+
+      SNOOP_WB_WAIT: begin
+        if (valid_miss_fsm) state_d = SNOOP_UPDATE;
+      end
+
+      // ~> GetS: M/S -> S, GetM: M/S -> I
+      SNOOP_UPDATE: begin
+        addr_o       = snoop_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
+        req_o        = snoop_way_q;
+        we_o         = 1'b1;
+        be_o.vldrty  = snoop_way_q;
+        data_o.valid = (snoop_q.req_type == CC_GETS);
+        snoop_ack_o  = 1'b1;
+        state_d      = snoop_ret_q;
+        // another core writes the reserved line
+        if (snoop_q.req_type == CC_GETM && snoop_q.addr[55:CVA6Cfg.DCACHE_OFFSET_WIDTH] == resv_addr_q)
+          resv_valid_d = 1'b0;
+      end
+
+      // ----------------------
+      // AMOs in the cache
+      // ----------------------
+      AMO_BUS_REQ: begin
+        cc_req_o.valid = 1'b1;
+        cc_req_o.req_type = CC_GETM;
+        cc_req_o.addr = {
+          mshr_q.addr[55:CVA6Cfg.DCACHE_OFFSET_WIDTH], {{CVA6Cfg.DCACHE_OFFSET_WIDTH} {1'b0}}
+        };
+        if (cc_gnt_i) begin
+          bus_held_d = 1'b1;
+          state_d    = AMO_LOOKUP;
+        end else if (snoop_accept) begin
+          state_d     = SNOOP_REQ;
+          snoop_ret_d = AMO_BUS_REQ;
+        end
+      end
+
+      AMO_LOOKUP: begin
+        req_o   = '1;
+        addr_o  = mshr_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
+        state_d = AMO_EXEC;
+      end
+
+      // ~> no snoop can come in while we hold the tenure, so the look-up and
+      //    the write below are atomic
+      AMO_EXEC: begin
+        if (amo_req_i.amo_op == AMO_SC && !sc_ok) begin
+          // reservation lost (or never taken): fail without writing
+          amo_resp_o.ack    = 1'b1;
+          amo_resp_o.result = 64'd1;
+          resv_valid_d      = 1'b0;
+          mshr_d.valid      = 1'b0;
+          amo_mshr_d        = 1'b0;
+          cc_done_o         = 1'b1;
+          bus_held_d        = 1'b0;
+          state_d           = IDLE;
+        end else if (|(present_way & owned_way)) begin
+          if (amo_req_i.amo_op != AMO_LR) begin
+            req_o       = present_way;
+            addr_o      = mshr_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
+            we_o        = 1'b1;
+            be_o.vldrty = present_way;
+            if (amo_req_i.size == 2'b10) begin
+              be_o.data[(amo_bit_off>>3)+:8] = mshr_q.addr[2] ? 8'hf0 : 8'h0f;
+              data_o.data[amo_bit_off+:64] = {amo_new[31:0], amo_new[31:0]};
+            end else begin
+              be_o.data[(amo_bit_off>>3)+:8] = 8'hff;
+              data_o.data[amo_bit_off+:64] = amo_new;
+            end
+            data_o.valid = 1'b1;
+            data_o.dirty = 1'b1;
+            data_o.owned = 1'b1;
+          end
+          if (amo_req_i.amo_op == AMO_LR) begin
+            resv_valid_d = 1'b1;
+            resv_addr_d  = mshr_q.addr[55:CVA6Cfg.DCACHE_OFFSET_WIDTH];
+          end else if (amo_req_i.amo_op == AMO_SC) begin
+            resv_valid_d = 1'b0;
+          end
+          amo_resp_o.ack    = 1'b1;
+          amo_resp_o.result = (amo_req_i.amo_op == AMO_SC) ? 64'd0 : amo_ret;
+          mshr_d.valid      = 1'b0;
+          amo_mshr_d        = 1'b0;
+          if (amo_req_i.amo_op == AMO_LR) begin
+            // Two cores running LR/SC loops on one line would otherwise kill
+            // each other's reservations forever. Keep the tenure (no snoop
+            // can reach the line) for a bounded time so the SC succeeds.
+            state_d   = LR_HOLD;
+            lr_hold_d = LrHoldCycles[$bits(lr_hold_d)-1:0];
+          end else begin
+            cc_done_o  = 1'b1;
+            bus_held_d = 1'b0;
+            state_d    = IDLE;
+          end
+        end else begin
+          // absent or S: fetch it in M under this tenure, then come back
+          state_d = MISS;
+        end
+      end
+
+      // ~> only the SC to the reserved line runs under the LR tenure; the
+      //    tenure covers that line only, and anything else (including another
+      //    LR, e.g. a spin loop) must not keep the other cores out
+      LR_HOLD: begin
+        if (amo_req_i.req && !busy_i && amo_req_i.amo_op == AMO_SC &&
+            amo_req_i.operand_a[55:CVA6Cfg.DCACHE_OFFSET_WIDTH] == resv_addr_q) begin
+          state_d      = AMO_LOOKUP;
+          mshr_d.valid = 1'b1;
+          mshr_d.we    = 1'b1;
+          mshr_d.id    = '0;
+          mshr_d.addr  = amo_req_i.operand_a[55:0];
+          mshr_d.wdata = '0;
+          mshr_d.be    = '0;
+          amo_mshr_d   = 1'b1;
+        end else if (amo_req_i.req || flush_i || any_miss_req || lr_hold_q == '0) begin
+          cc_done_o  = 1'b1;
+          bus_held_d = 1'b0;
+          state_d    = IDLE;
+        end else begin
+          lr_hold_d = lr_hold_q - 1'b1;
+        end
+      end
+
       default: ;
     endcase
+
+    if (snoop_accept) snoop_d = snoop_i;
   end
 
+  // ----------------------
+  // AMO data path
+  // ----------------------
+  assign amo_cacheable = config_pkg::is_inside_cacheable_regions(
+      CVA6Cfg, {{{64 - CVA6Cfg.PLEN} {1'b0}}, amo_req_i.operand_a[CVA6Cfg.PLEN-1:0]}
+  );
+
+  always_comb begin : amo_operands
+    automatic logic [31:0] old_word;
+    automatic logic unsigned_op;
+    amo_line = '0;
+    for (int unsigned i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++)
+    if (data_i[i].valid && data_i[i].tag ==
+        mshr_q.addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_INDEX_WIDTH])
+      amo_line = data_i[i].data;
+    amo_bit_off = mshr_q.addr[CVA6Cfg.DCACHE_OFFSET_WIDTH-1:3] << 6;
+    amo_old = amo_line[amo_bit_off+:64];
+    old_word = mshr_q.addr[2] ? amo_old[63:32] : amo_old[31:0];
+    unsigned_op = amo_req_i.amo_op inside {AMO_MAXU, AMO_MINU};
+    if (amo_req_i.size == 2'b10) begin
+      // 32b operations compare as 32b values
+      amo_operand_a_ext = unsigned_op ? {32'b0, old_word} : {{32{old_word[31]}}, old_word};
+      amo_operand_b_ext = unsigned_op ? {32'b0, amo_req_i.operand_b[31:0]} :
+          {{32{amo_req_i.operand_b[31]}}, amo_req_i.operand_b[31:0]};
+      amo_ret = {{32{old_word[31]}}, old_word};
+    end else begin
+      amo_operand_a_ext = amo_old;
+      amo_operand_b_ext = amo_req_i.operand_b;
+      amo_ret = amo_old;
+    end
+  end
+
+  amo_alu #(
+      .CVA6Cfg(CVA6Cfg)
+  ) i_amo_alu (
+      .amo_op_i       (amo_req_i.amo_op),
+      .amo_operand_a_i(amo_operand_a_ext),
+      .amo_operand_b_i(amo_operand_b_ext),
+      .amo_result_o   (amo_new)
+  );
+
   // check MSHR for aliasing
+  logic [55:0] snoop_set_addr;
+  assign snoop_set_addr = snoop_accept ? snoop_i.addr : snoop_q.addr;
+
   always_comb begin
 
     mshr_addr_matches_o  = 'b0;
@@ -516,6 +900,13 @@ module miss_handler
       if (mshr_q.valid && mshr_addr_i[i][CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] == mshr_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH]) begin
         mshr_index_matches_o[i] = 1'b1;
       end
+
+      // a snoop on the set holds off stores, they are non-atomic (look-up,
+      // then write) and must not write a line the snoop just took away
+      if (snoop_busy && mshr_addr_i[i][CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] ==
+          snoop_set_addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH]) begin
+        mshr_index_matches_o[i] = 1'b1;
+      end
     end
   end
   // --------------------
@@ -529,6 +920,14 @@ module miss_handler
       evict_way_q <= '0;
       evict_cl_q  <= '0;
       serve_amo_q <= 1'b0;
+      bus_held_q  <= 1'b0;
+      snoop_q     <= '0;
+      snoop_ret_q <= IDLE;
+      snoop_way_q <= '0;
+      amo_mshr_q  <= 1'b0;
+      resv_valid_q <= 1'b0;
+      resv_addr_q <= '0;
+      lr_hold_q   <= '0;
     end else begin
       mshr_q      <= mshr_d;
       state_q     <= state_d;
@@ -536,6 +935,14 @@ module miss_handler
       evict_way_q <= evict_way_d;
       evict_cl_q  <= evict_cl_d;
       serve_amo_q <= serve_amo_d;
+      bus_held_q  <= bus_held_d;
+      snoop_q     <= snoop_d;
+      snoop_ret_q <= snoop_ret_d;
+      snoop_way_q <= snoop_way_d;
+      amo_mshr_q  <= amo_mshr_d;
+      resv_valid_q <= resv_valid_d;
+      resv_addr_q <= resv_addr_d;
+      lr_hold_q   <= lr_hold_d;
     end
   end
 

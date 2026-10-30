@@ -107,7 +107,14 @@ module ariane import ariane_pkg::*; #(
     .cvxif_req_o          ( cvxif_req                 ),
     .cvxif_resp_i         ( cvxif_resp                ),
     .noc_req_o            ( noc_req_o                 ),
-    .noc_resp_i           ( noc_resp_i                )
+    .noc_resp_i           ( noc_resp_i                ),
+    // single core: no coherence bus
+    .cc_req_o             (                           ),
+    .cc_gnt_i             ( 1'b0                      ),
+    .cc_done_o            (                           ),
+    .snoop_i              ( '0                        ),
+    .snoop_ready_o        (                           ),
+    .snoop_ack_o          (                           )
   );
 
   if (CVA6Cfg.CvxifEn) begin: gen_cvxif

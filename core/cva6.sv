@@ -23,6 +23,9 @@ module cva6
         cva6_config_pkg::cva6_cfg
     ),
     parameter int unsigned CA_TAG_SET_DEPTH = 8,
+    // Coherent write-back L1 (DCacheType WB): use the cc_*/snoop_* ports below.
+    // When 0, every coherence request is granted at once and nothing is snooped.
+    parameter bit CoherentL1 = 1'b0,
 
     // RVFI PROBES
     parameter type rvfi_probes_instr_t = `RVFI_PROBES_INSTR_T(CVA6Cfg),
@@ -350,7 +353,19 @@ module cva6
     // noc request, can be AXI or OpenPiton - SUBSYSTEM
     output noc_req_t noc_req_o,
     // noc response, can be AXI or OpenPiton - SUBSYSTEM
-    input noc_resp_t noc_resp_i
+    input noc_resp_t noc_resp_i,
+    // MSI coherence bus request, used with CoherentL1 - SUBSYSTEM
+    output std_cache_pkg::cc_req_t cc_req_o,
+    // MSI coherence bus grant - SUBSYSTEM
+    input logic cc_gnt_i,
+    // MSI coherence tenure done - SUBSYSTEM
+    output logic cc_done_o,
+    // MSI snoop from the coherence bus - SUBSYSTEM
+    input std_cache_pkg::cc_snoop_t snoop_i,
+    // MSI snoop accepted - SUBSYSTEM
+    output logic snoop_ready_o,
+    // MSI snoop served - SUBSYSTEM
+    output logic snoop_ack_o
 );
 
   localparam type interrupts_t = struct packed {
@@ -1512,6 +1527,10 @@ module cva6
         // D$
         .dcache_enable_i   (dcache_en_csr),
         .dcache_flush_i    (dcache_flush_ctrl_cache),
+        .snoop_valid_i      (1'b0),
+        .snoop_addr_i       ('0),
+        .snoop_ready_o      (),
+        .snoop_ack_o        (),
         .dcache_flush_ack_o(dcache_flush_ack_cache_ctrl),
         .ca_flush_i        (flush_ctrl_ex | flush_commit),
         .ca_commit_valid_i (ca_commit_valid),
@@ -1540,6 +1559,11 @@ module cva6
     assign dcache_dat_unc_err_csr = 1'b0;
     assign dcache_dir_cor_err_csr = 1'b0;
     assign dcache_dir_unc_err_csr = 1'b0;
+    // no MSI coherence on this cache
+    assign cc_req_o      = '0;
+    assign cc_done_o     = 1'b0;
+    assign snoop_ready_o = 1'b0;
+    assign snoop_ack_o   = 1'b0;
   end else if (
         CVA6Cfg.DCacheType == config_pkg::HPDCACHE_WT ||
         CVA6Cfg.DCacheType == config_pkg::HPDCACHE_WB ||
@@ -1613,7 +1637,21 @@ module cva6
     );
     assign inval_ready   = 1'b1;
     assign miss_vld_bits = '0;
+    // no MSI coherence on this cache
+    assign cc_req_o      = '0;
+    assign cc_done_o     = 1'b0;
+    assign snoop_ready_o = 1'b0;
+    assign snoop_ack_o   = 1'b0;
   end else begin : gen_cache_wb
+    std_cache_pkg::cc_req_t cc_req;
+    logic cc_gnt;
+    std_cache_pkg::cc_snoop_t cc_snoop;
+
+    // single core: every coherence request is granted at once, no snoops
+    assign cc_gnt   = CoherentL1 ? cc_gnt_i : cc_req.valid;
+    assign cc_snoop = CoherentL1 ? snoop_i : '0;
+    assign cc_req_o = CoherentL1 ? cc_req : '0;
+
     std_cache_subsystem #(
         // note: this only works with one cacheable region
         // not as important since this cache subsystem is about to be
@@ -1661,7 +1699,13 @@ module cva6
         .dcache_req_ports_o(dcache_req_from_cache),
         // memory side
         .axi_req_o         (noc_req_o),
-        .axi_resp_i        (noc_resp_i)
+        .axi_resp_i        (noc_resp_i),
+        .cc_req_o          (cc_req),
+        .cc_gnt_i          (cc_gnt),
+        .cc_done_o         (cc_done_o),
+        .snoop_i           (cc_snoop),
+        .snoop_ready_o     (snoop_ready_o),
+        .snoop_ack_o       (snoop_ack_o)
     );
     assign dcache_commit_wbuffer_not_ni = 1'b1;
     assign dcache_scrub_cycle_csr       = 1'b0;

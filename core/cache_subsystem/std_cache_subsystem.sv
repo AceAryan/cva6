@@ -63,7 +63,14 @@ module std_cache_subsystem
     output dcache_req_o_t [NumPorts-1:0] dcache_req_ports_o,  // to/from LSU
     // memory side
     output axi_req_t axi_req_o,
-    input axi_rsp_t axi_resp_i
+    input axi_rsp_t axi_resp_i,
+    // coherence bus (MSI)
+    output cc_req_t cc_req_o,
+    input logic cc_gnt_i,
+    output logic cc_done_o,
+    input cc_snoop_t snoop_i,
+    output logic snoop_ready_o,
+    output logic snoop_ack_o
 );
 
   assign wbuffer_empty_o = 1'b1;
@@ -126,7 +133,13 @@ module std_cache_subsystem
       .req_ports_i (dcache_req_ports_i),
       .req_ports_o (dcache_req_ports_o),
       .amo_req_i,
-      .amo_resp_o
+      .amo_resp_o,
+      .cc_req_o,
+      .cc_gnt_i,
+      .cc_done_o,
+      .snoop_i,
+      .snoop_ready_o,
+      .snoop_ack_o
   );
 
   // -----------------------

@@ -98,11 +98,16 @@ module cache_ctrl
   assign tag_o  = mem_req_d.tag;
 
   logic [CVA6Cfg.DCACHE_LINE_WIDTH-1:0] cl_i;
+  logic hit_owned;  // the hit line is in M and may be written
 
   always_comb begin : way_select
     cl_i = '0;
+    hit_owned = 1'b0;
     for (int unsigned i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++)
-    if (hit_way_i[i]) cl_i = data_i[i].data;
+    if (hit_way_i[i]) begin
+      cl_i = data_i[i].data;
+      hit_owned = data_i[i].owned;
+    end
 
     // cl_i = data_i[one_hot_to_bin(hit_way_i)].data;
   end
@@ -193,7 +198,10 @@ module cache_ctrl
           // ------------
           // HIT CASE
           // ------------
-          if (|hit_way_i) begin
+          // a store hitting an S line is a miss, it has to obtain ownership first.
+          // A hit on the MSHR line is no hit either: it is an S copy being
+          // refetched for a store that has already been granted.
+          if (|hit_way_i && (!mem_req_q.we || hit_owned) && !mshr_addr_matches_i) begin
             // we can request another cache-line if this was a load
             if (req_port_i.data_req && !mem_req_q.we && !flush_i) begin
               state_d             = WAIT_TAG;  // switch back to WAIT_TAG
@@ -318,9 +326,11 @@ module cache_ctrl
           be_o.data[cl_offset>>3+:CVA6Cfg.XLEN/8] = mem_req_q.be;
           data_o.data[cl_offset+:CVA6Cfg.XLEN]    = mem_req_q.wdata;
           data_o.tag                              = mem_req_d.tag;
-          // ~> change the state
+          // ~> change the state, the line was M at look-up and a snoop holds
+          //    us off through the MSHR index match before it can change that
           data_o.dirty                            = 1'b1;
           data_o.valid                            = 1'b1;
+          data_o.owned                            = 1'b1;
 
           // got a grant ~> this is finished now
           if (gnt_i) begin

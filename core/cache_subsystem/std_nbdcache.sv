@@ -41,7 +41,14 @@ module std_nbdcache
     output axi_req_t axi_data_o,
     input axi_rsp_t axi_data_i,
     output axi_req_t axi_bypass_o,
-    input axi_rsp_t axi_bypass_i
+    input axi_rsp_t axi_bypass_i,
+    // Coherence bus
+    output cc_req_t cc_req_o,
+    input logic cc_gnt_i,
+    output logic cc_done_o,
+    input cc_snoop_t snoop_i,
+    output logic snoop_ready_o,
+    output logic snoop_ack_o
 );
 
   import std_cache_pkg::*;
@@ -53,11 +60,12 @@ module std_nbdcache
     logic [CVA6Cfg.DCACHE_LINE_WIDTH-1:0] data;   // data array
     logic                                 valid;  // state array
     logic                                 dirty;  // state array
+    logic                                 owned;  // state array, M when valid
   };
   localparam type cl_be_t = struct packed {
     logic [(CVA6Cfg.DCACHE_TAG_WIDTH+7)/8-1:0] tag;  // byte enable into tag array
     logic [(CVA6Cfg.DCACHE_LINE_WIDTH+7)/8-1:0] data;  // byte enable into data array
-    logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0]        vldrty; // bit enable into state array (valid for a pair of dirty/valid bits)
+    logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0]        vldrty; // bit enable into state array (valid for the valid/dirty/owned bits of a way)
   };
 
   // -------------------------------
@@ -183,6 +191,12 @@ module std_nbdcache
       .be_o                 (be[0]),
       .data_o               (wdata[0]),
       .we_o                 (we[0]),
+      .cc_req_o,
+      .cc_gnt_i,
+      .cc_done_o,
+      .snoop_i,
+      .snoop_ready_o,
+      .snoop_ack_o,
       .axi_bypass_o,
       .axi_bypass_i,
       .axi_data_o,
@@ -234,7 +248,7 @@ module std_nbdcache
   // Valid/Dirty Regs
   // ----------------
 
-  // align each valid/dirty bit pair to a byte boundary in order to leverage byte enable signals.
+  // align each valid/dirty/owned bit triple to a byte boundary in order to leverage byte enable signals.
   // note: if you have an SRAM that supports flat bit enables for your target technology,
   // you can use it here to save the extra 4x overhead introduced by this workaround.
   logic [4*DCACHE_DIRTY_WIDTH-1:0] dirty_wdata, dirty_rdata;
@@ -242,8 +256,10 @@ module std_nbdcache
   for (genvar i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin
     assign dirty_wdata[8*i]   = wdata_ram.dirty;
     assign dirty_wdata[8*i+1] = wdata_ram.valid;
+    assign dirty_wdata[8*i+2] = wdata_ram.owned;
     assign rdata_ram[i].dirty = dirty_rdata[8*i];
     assign rdata_ram[i].valid = dirty_rdata[8*i+1];
+    assign rdata_ram[i].owned = dirty_rdata[8*i+2];
   end
 
   sram #(

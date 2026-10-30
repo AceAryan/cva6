@@ -41,6 +41,10 @@ module wt_dcache
     input logic ca_invalidate_valid_i,
     input logic ca_invalidate_all_i,
     input logic [CVA6Cfg.PLEN-1:0] ca_invalidate_addr_i,
+    input logic snoop_valid_i,
+    input logic [CVA6Cfg.PLEN-1:0] snoop_addr_i,  // line-aligned physical address
+    output logic snoop_ready_o,
+    output logic snoop_ack_o,
     output logic flush_ack_o,  // send a single cycle acknowledge signal when the cache is flushed
     output logic miss_o,  // we missed on a ld/st
     output logic wbuffer_empty_o,
@@ -140,6 +144,20 @@ module wt_dcache
   logic [(1 << CVA6Cfg.TRANS_ID_BITS)-1:0] ca_query_failed;
   logic                                 meta_busy;
   logic                                 rd_blocked;
+
+  logic snoop_ca_invalidate_valid;
+  logic [CVA6Cfg.PLEN-1:0] snoop_ca_invalidate_addr;
+  logic snoop_ca_invalidate_ack;
+
+  logic snoop_meta_query_req;
+  logic [DCACHE_CL_IDX_WIDTH-1:0] snoop_meta_query_idx;
+  logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] snoop_meta_query_tag;
+  logic snoop_meta_query_ready;
+  logic snoop_meta_query_valid;
+  logic snoop_meta_query_match;
+  logic snoop_meta_query_ca;
+  logic [$clog2(CVA6Cfg.DCACHE_SET_ASSOC)-1:0] snoop_meta_query_way;
+
   assign rd_blocked = wr_cl_vld | meta_busy;
 
   wt_dcache_ca_tag_set #(
@@ -163,6 +181,9 @@ module wt_dcache
       .invalidate_valid_i(ca_invalidate_valid_i),
       .invalidate_all_i(ca_invalidate_all_i),
       .invalidate_addr_i(ca_invalidate_addr_i),
+      .snoop_invalidate_valid_i(snoop_ca_invalidate_valid),
+      .snoop_invalidate_addr_i(snoop_ca_invalidate_addr),
+      .snoop_invalidate_done_o(snoop_ca_invalidate_ack),
       .cwrite_addr_i({req_ports_i[NumPorts-1].address_tag,
                       req_ports_i[NumPorts-1].address_index}),
       .access_revoked_o(ca_access_revoked),
@@ -186,6 +207,21 @@ module wt_dcache
       .rst_ni         (rst_ni),
       .enable_i       (enable_i),
       .flush_i        (flush_i),
+      .snoop_valid_i  (snoop_valid_i),
+      .snoop_addr_i   (snoop_addr_i),
+      .snoop_ready_o  (snoop_ready_o),
+      .snoop_ack_o    (snoop_ack_o),
+      .snoop_ca_invalidate_valid_o(snoop_ca_invalidate_valid),
+      .snoop_ca_invalidate_addr_o(snoop_ca_invalidate_addr),
+      .snoop_ca_invalidate_ack_i(snoop_ca_invalidate_ack),
+      .snoop_meta_query_req_o(snoop_meta_query_req),
+      .snoop_meta_query_idx_o(snoop_meta_query_idx),
+      .snoop_meta_query_tag_o(snoop_meta_query_tag),
+      .snoop_meta_query_ready_i(snoop_meta_query_ready),
+      .snoop_meta_query_valid_i(snoop_meta_query_valid),
+      .snoop_meta_query_match_i(snoop_meta_query_match),
+      .snoop_meta_query_ca_i(snoop_meta_query_ca),
+      .snoop_meta_query_way_i(snoop_meta_query_way),
       .flush_ack_o    (flush_ack_o),
       .miss_o         (miss_o),
       .wbuffer_empty_i(wbuffer_empty_o),
@@ -414,6 +450,14 @@ module wt_dcache
       .ca_meta_idx_i ('0),
       .ca_meta_tag_i ('0),
       .ca_meta_ready_o(),
+      .ca_meta_query_req_i(snoop_meta_query_req),
+      .ca_meta_query_idx_i(snoop_meta_query_idx),
+      .ca_meta_query_tag_i(snoop_meta_query_tag),
+      .ca_meta_query_ready_o(snoop_meta_query_ready),
+      .ca_meta_query_valid_o(snoop_meta_query_valid),
+      .ca_meta_query_match_o(snoop_meta_query_match),
+      .ca_meta_query_ca_o(snoop_meta_query_ca),
+      .ca_meta_query_way_o(snoop_meta_query_way),
       .meta_busy_o    (meta_busy),
       .ca_departed_o (),
       // single word write port

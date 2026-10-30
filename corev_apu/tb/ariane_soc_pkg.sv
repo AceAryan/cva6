@@ -17,7 +17,11 @@ package ariane_soc;
   localparam int unsigned NumSources = 30;
   localparam int unsigned MaxPriority = 7;
 
+`ifdef CVA6_2CORE
+  localparam NrSlaves = 3; // actually masters: core 0, debug module, core 1
+`else
   localparam NrSlaves = 2; // actually masters, but slaves on the crossbar
+`endif
 
   typedef enum int unsigned {
     DRAM     = 0,

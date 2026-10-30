@@ -209,6 +209,10 @@ module tb import tb_pkg::*; import ariane_pkg::*; import wt_cache_pkg::*; #()();
     .clk_i           ( clk_i           ),
     .rst_ni          ( rst_ni          ),
     .flush_i         ( flush_i         ),
+    .snoop_valid_i   ( 1'b0            ),
+    .snoop_addr_i    ( '0              ),
+    .snoop_ready_o   (                 ),
+    .snoop_ack_o     (                 ),
     .flush_ack_o     ( flush_ack_o     ),
     .enable_i        ( enable_i        ),
     .miss_o          ( miss_o          ),
@@ -622,7 +626,6 @@ module tb import tb_pkg::*; import ariane_pkg::*; import wt_cache_pkg::*; #()();
 
 
 endmodule
-
 
 
 

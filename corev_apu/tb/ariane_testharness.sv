@@ -16,6 +16,9 @@
 `include "axi/assign.svh"
 `include "rvfi_types.svh"
 `include "iti_types.svh"
+`ifdef CVA6_2CORE
+`include "cvxif_types.svh"
+`endif
 
 `ifdef VERILATOR
 `include "custom_uvm_macros.svh"
@@ -631,6 +634,110 @@ module ariane_testharness #(
   rvfi_to_iti_t rvfi_to_iti;
   iti_to_encoder_t iti_to_encoder;
 
+`ifdef CVA6_2CORE
+  // ---------------
+  // Two cores with coherent write-back L1s (MSI over cc_bus). Core 0 is hart 0
+  // and owns interrupts, debug and the RVFI trace; core 1 is hart 1 and
+  // shares the boot ROM, it tells itself apart through mhartid.
+  // ---------------
+  localparam type readregflags_t      = `READREGFLAGS_T(CVA6Cfg);
+  localparam type writeregflags_t     = `WRITEREGFLAGS_T(CVA6Cfg);
+  localparam type id_t                = `ID_T(CVA6Cfg);
+  localparam type hartid_t            = `HARTID_T(CVA6Cfg);
+  localparam type x_compressed_req_t  = `X_COMPRESSED_REQ_T(CVA6Cfg, hartid_t);
+  localparam type x_compressed_resp_t = `X_COMPRESSED_RESP_T(CVA6Cfg);
+  localparam type x_issue_req_t       = `X_ISSUE_REQ_T(CVA6Cfg, hartid_t, id_t);
+  localparam type x_issue_resp_t      = `X_ISSUE_RESP_T(CVA6Cfg, writeregflags_t, readregflags_t);
+  localparam type x_register_t        = `X_REGISTER_T(CVA6Cfg, hartid_t, id_t, readregflags_t);
+  localparam type x_commit_t          = `X_COMMIT_T(CVA6Cfg, hartid_t, id_t);
+  localparam type x_result_t          = `X_RESULT_T(CVA6Cfg, hartid_t, id_t, writeregflags_t);
+  localparam type cvxif_req_t         = `CVXIF_REQ_T(CVA6Cfg, x_compressed_req_t, x_issue_req_t, x_register_t, x_commit_t);
+  localparam type cvxif_resp_t        = `CVXIF_RESP_T(CVA6Cfg, x_compressed_resp_t, x_issue_resp_t, x_result_t);
+
+  ariane_axi::req_t    [1:0] axi_core_req;
+  ariane_axi::resp_t   [1:0] axi_core_resp;
+  rvfi_probes_t        [1:0] core_rvfi_probes;
+  std_cache_pkg::cc_req_t   [1:0] cc_req;
+  logic                     [1:0] cc_gnt, cc_done, snoop_ready, snoop_ack;
+  std_cache_pkg::cc_snoop_t [1:0] cc_snoop;
+
+  initial if (CVA6Cfg.DCacheType != config_pkg::WB || CVA6Cfg.CvxifEn)
+    $fatal(1, "CVA6_2CORE needs the write-back D-cache and no CVXIF");
+
+  for (genvar c = 0; c < 2; c++) begin : gen_cores
+    cvxif_req_t cvxif_req;
+    cva6 #(
+      .CVA6Cfg             ( CVA6Cfg             ),
+      .CoherentL1          ( 1'b1                ),
+      .rvfi_probes_instr_t ( rvfi_probes_instr_t ),
+      .rvfi_probes_csr_t   ( rvfi_probes_csr_t   ),
+      .rvfi_probes_t       ( rvfi_probes_t       ),
+      .axi_ar_chan_t       ( ariane_axi::ar_chan_t ),
+      .axi_aw_chan_t       ( ariane_axi::aw_chan_t ),
+      .axi_w_chan_t        ( ariane_axi::w_chan_t  ),
+      .noc_req_t           ( ariane_axi::req_t   ),
+      .noc_resp_t          ( ariane_axi::resp_t  ),
+      .readregflags_t      ( readregflags_t      ),
+      .writeregflags_t     ( writeregflags_t     ),
+      .id_t                ( id_t                ),
+      .hartid_t            ( hartid_t            ),
+      .x_compressed_req_t  ( x_compressed_req_t  ),
+      .x_compressed_resp_t ( x_compressed_resp_t ),
+      .x_issue_req_t       ( x_issue_req_t       ),
+      .x_issue_resp_t      ( x_issue_resp_t      ),
+      .x_register_t        ( x_register_t        ),
+      .x_commit_t          ( x_commit_t          ),
+      .x_result_t          ( x_result_t          ),
+      .cvxif_req_t         ( cvxif_req_t         ),
+      .cvxif_resp_t        ( cvxif_resp_t        )
+    ) i_cva6 (
+      .clk_i         ( clk_i                                 ),
+      .rst_ni        ( ndmreset_n                            ),
+      .boot_addr_i   ( ariane_soc::ROMBase                   ),
+      .hart_id_i     ( CVA6Cfg.XLEN'(c)                      ),
+      .irq_i         ( (c == 0) ? irqs : 2'b00               ),
+      .ipi_i         ( (c == 0) ? ipi : 1'b0                 ),
+      .time_irq_i    ( (c == 0) ? timer_irq : 1'b0           ),
+`ifdef SPIKE_TANDEM
+      .debug_req_i   ( 1'b0                                  ),
+`else
+      .debug_req_i   ( (c == 0) ? debug_req_core : 1'b0      ),
+`endif
+      .rvfi_probes_o ( core_rvfi_probes[c]                   ),
+      .cvxif_req_o   ( cvxif_req                             ),
+      .cvxif_resp_i  ( '0                                    ),
+      .noc_req_o     ( axi_core_req[c]                       ),
+      .noc_resp_i    ( axi_core_resp[c]                      ),
+      .cc_req_o      ( cc_req[c]                             ),
+      .cc_gnt_i      ( cc_gnt[c]                             ),
+      .cc_done_o     ( cc_done[c]                            ),
+      .snoop_i       ( cc_snoop[c]                           ),
+      .snoop_ready_o ( snoop_ready[c]                        ),
+      .snoop_ack_o   ( snoop_ack[c]                          )
+    );
+  end
+  assign rvfi_probes      = core_rvfi_probes[0];
+  assign axi_ariane_req   = axi_core_req[0];
+  assign axi_core_resp[0] = axi_ariane_resp;
+
+  cc_bus #(
+    .NumCaches     ( 2           )
+  ) i_cc_bus (
+    .clk_i         ( clk_i       ),
+    .rst_ni        ( ndmreset_n  ),
+    .req_i         ( cc_req      ),
+    .gnt_o         ( cc_gnt      ),
+    .done_i        ( cc_done     ),
+    .snoop_o       ( cc_snoop    ),
+    .snoop_ready_i ( snoop_ready ),
+    .snoop_ack_i   ( snoop_ack   ),
+    .busy_o        (             ),
+    .owner_o       (             )
+  );
+
+  `AXI_ASSIGN_FROM_REQ(slave[2], axi_core_req[1])
+  `AXI_ASSIGN_TO_RESP(axi_core_resp[1], slave[2])
+`else
   ariane #(
     .CVA6Cfg              ( CVA6Cfg             ),
     .rvfi_probes_instr_t  ( rvfi_probes_instr_t ),
@@ -656,6 +763,7 @@ module ariane_testharness #(
     .noc_req_o            ( axi_ariane_req      ),
     .noc_resp_i           ( axi_ariane_resp     )
   );
+`endif
 
   `AXI_ASSIGN_FROM_REQ(slave[0], axi_ariane_req)
   `AXI_ASSIGN_TO_RESP(axi_ariane_resp, slave[0])

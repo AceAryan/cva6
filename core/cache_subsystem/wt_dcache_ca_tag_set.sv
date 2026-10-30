@@ -25,6 +25,9 @@ module wt_dcache_ca_tag_set
     input logic invalidate_valid_i,
     input logic invalidate_all_i,
     input logic [ADDR_WIDTH-1:0] invalidate_addr_i,
+    input logic snoop_invalidate_valid_i,
+    input logic [ADDR_WIDTH-1:0] snoop_invalidate_addr_i,
+    output logic snoop_invalidate_done_o,
     input logic [ADDR_WIDTH-1:0] cwrite_addr_i,
     output logic access_revoked_o,
     output logic cwrite_allowed_o,
@@ -48,6 +51,7 @@ module wt_dcache_ca_tag_set
     logic found;
     logic free_found;
     logic committed_match;
+    logic snoop_match;
     int unsigned free_idx;
 
     tag_valid_d = tag_valid_q;
@@ -60,7 +64,13 @@ module wt_dcache_ca_tag_set
     found = 1'b0;
     free_found = 1'b0;
     committed_match = 1'b0;
+    snoop_match = 1'b0;
     free_idx = 0;
+
+    for (int i = 0; i < DEPTH; i++) begin
+      snoop_match |= tag_valid_q[i] &&
+                     tag_addr_q[i] == line_address(snoop_invalidate_addr_i);
+    end
 
     for (int c = 0; c < NUM_COMMIT_PORTS; c++) begin
       if (commit_valid_i[c] && !flush_i && int'(commit_id_i[c]) < PENDING_DEPTH &&
@@ -86,6 +96,10 @@ module wt_dcache_ca_tag_set
               end else begin
                 revoked_d = 1'b1;
               end
+            end
+            for (int i = 0; i < DEPTH; i++) begin
+              snoop_match |= tag_valid_d[i] &&
+                             tag_addr_d[i] == line_address(snoop_invalidate_addr_i);
             end
           end
           CA_UNTAG_ONE: begin
@@ -115,21 +129,32 @@ module wt_dcache_ca_tag_set
       pending_invalidated_d[issue_id_i] = 1'b0;
     end
 
-    if (invalidate_valid_i) begin
-      for (int i = 0; i < DEPTH; i++) begin
-        if (tag_valid_d[i] &&
+    for (int i = 0; i < DEPTH; i++) begin
+      if (tag_valid_d[i] &&
+          ((invalidate_valid_i && invalidate_all_i) ||
+           (invalidate_valid_i &&
+            tag_addr_d[i] == line_address(invalidate_addr_i)) ||
+           (snoop_invalidate_valid_i &&
+            tag_addr_d[i] == line_address(snoop_invalidate_addr_i)))) begin
+        if (invalidate_valid_i &&
             (invalidate_all_i || tag_addr_d[i] == line_address(invalidate_addr_i))) begin
           committed_match = 1'b1;
-          tag_valid_d[i] = 1'b0;
         end
+        tag_valid_d[i] = 1'b0;
       end
-      for (int i = 0; i < PENDING_DEPTH; i++) begin
-        if (pending_valid_d[i] && pending_op_d[i] == CA_CREAD &&
-            (invalidate_all_i || pending_addr_d[i] == line_address(invalidate_addr_i))) begin
-          pending_invalidated_d[i] = 1'b1;
-        end
+    end
+    for (int i = 0; i < PENDING_DEPTH; i++) begin
+      if (pending_valid_d[i] && pending_op_d[i] == CA_CREAD &&
+          ((invalidate_valid_i && invalidate_all_i) ||
+           (invalidate_valid_i &&
+            pending_addr_d[i] == line_address(invalidate_addr_i)) ||
+           (snoop_invalidate_valid_i &&
+            pending_addr_d[i] == line_address(snoop_invalidate_addr_i)))) begin
+        pending_invalidated_d[i] = 1'b1;
       end
-      if (committed_match) revoked_d = 1'b1;
+    end
+    if (committed_match || (snoop_invalidate_valid_i && snoop_match)) begin
+      revoked_d = 1'b1;
     end
 
     if (flush_i) begin
@@ -149,6 +174,10 @@ module wt_dcache_ca_tag_set
             (invalidate_all_i || tag_addr_q[i] == line_address(invalidate_addr_i))) begin
           committed_invalidate_match = 1'b1;
         end
+        if (snoop_invalidate_valid_i &&
+            tag_addr_q[i] == line_address(snoop_invalidate_addr_i)) begin
+          committed_invalidate_match = 1'b1;
+        end
       end
     end
     if (committed_invalidate_match) access_revoked_o = 1'b1;
@@ -162,9 +191,13 @@ module wt_dcache_ca_tag_set
                           !flush_i &&
                           (pending_invalidated_q[i] || (invalidate_valid_i &&
                             (invalidate_all_i ||
-                             pending_addr_q[i] == line_address(invalidate_addr_i))));
+                             pending_addr_q[i] == line_address(invalidate_addr_i))) ||
+                           (snoop_invalidate_valid_i &&
+                            pending_addr_q[i] == line_address(snoop_invalidate_addr_i)));
     end
   end
+
+  assign snoop_invalidate_done_o = snoop_invalidate_valid_i;
 
   initial begin : p_parameter_checks
     assert (DEPTH > 0) else $fatal(1, "CA tag-set depth must be nonzero");

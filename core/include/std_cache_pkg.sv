@@ -56,5 +56,34 @@ package std_cache_pkg;
     logic [63:0] rdata;
   } bypass_rsp_t;
 
+  // ----------------------
+  // MSI coherence
+  // ----------------------
+  // Line states are encoded in the valid/owned/dirty bits of the status array:
+  //   I: valid = 0
+  //   S: valid = 1, owned = 0 (never dirty)
+  //   M: valid = 1, owned = 1 (dirty only if written since the fill)
+  typedef enum logic [1:0] {
+    CC_GETS = 2'b00,  // read a line, other caches downgrade M -> S
+    CC_GETM = 2'b01,  // obtain ownership, other caches invalidate
+    CC_PUTM = 2'b10   // write back an owned line, nobody else holds it
+  } cc_req_type_e;
+
+  // Coherence bus request, held until granted. The grant starts a tenure
+  // during which no other cache touches memory or receives a conflicting
+  // snoop; the requester ends it with a single-cycle done pulse.
+  typedef struct packed {
+    logic         valid;
+    cc_req_type_e req_type;
+    logic [55:0]  addr;  // line-aligned physical address
+  } cc_req_t;
+
+  // Snoop towards a cache; only CC_GETS and CC_GETM are ever snooped.
+  typedef struct packed {
+    logic         valid;
+    cc_req_type_e req_type;
+    logic [55:0]  addr;  // line-aligned physical address
+  } cc_snoop_t;
+
 endpackage : std_cache_pkg
 

@@ -195,7 +195,9 @@ ${CVA6_REPO_DIR}/core/cache_subsystem/wt_cache_subsystem.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/wt_axi_adapter.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/tag_cmp.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/axi_adapter.sv
+${CVA6_REPO_DIR}/core/cache_subsystem/amo_alu.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/miss_handler.sv
+${CVA6_REPO_DIR}/core/cache_subsystem/cc_bus.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/cache_ctrl.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/cva6_icache_axi_wrapper.sv
 ${CVA6_REPO_DIR}/core/cache_subsystem/std_cache_subsystem.sv

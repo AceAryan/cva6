@@ -30,6 +30,21 @@ module wt_dcache_missunit
     // cache management, signals from/to core
     input logic enable_i,  // from CSR
     input  logic                                       flush_i,     // flush request, this waits for pending tx (write, read) to finish and will clear the cache
+    input logic snoop_valid_i,
+    input logic [CVA6Cfg.PLEN-1:0] snoop_addr_i,
+    output logic snoop_ready_o,
+    output logic snoop_ack_o,
+    output logic snoop_ca_invalidate_valid_o,
+    output logic [CVA6Cfg.PLEN-1:0] snoop_ca_invalidate_addr_o,
+    input logic snoop_ca_invalidate_ack_i,
+    output logic snoop_meta_query_req_o,
+    output logic [DCACHE_CL_IDX_WIDTH-1:0] snoop_meta_query_idx_o,
+    output logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] snoop_meta_query_tag_o,
+    input logic snoop_meta_query_ready_i,
+    input logic snoop_meta_query_valid_i,
+    input logic snoop_meta_query_match_i,
+    input logic snoop_meta_query_ca_i,
+    input logic [$clog2(CVA6Cfg.DCACHE_SET_ASSOC)-1:0] snoop_meta_query_way_i,
     output logic flush_ack_o,  // send a single cycle acknowledge signal when the cache is flushed
     output logic miss_o,  // we missed on a ld/st
     // local cache management signals
@@ -123,6 +138,14 @@ module wt_dcache_missunit
   } state_e;
   state_e state_d, state_q;
 
+  typedef enum logic [1:0] {
+    SNOOP_IDLE,
+    SNOOP_QUERY_REQ,
+    SNOOP_QUERY_WAIT,
+    SNOOP_PROCESS
+  } snoop_state_e;
+  snoop_state_e snoop_state_d, snoop_state_q;
+
   // MSHR for reads
   typedef struct packed {
     logic [CVA6Cfg.PLEN-1:0]                     paddr;
@@ -138,6 +161,7 @@ module wt_dcache_missunit
   mshr_t mshr_d, mshr_q;
   logic [$clog2(CVA6Cfg.DCACHE_SET_ASSOC)-1:0] repl_way, inv_way, rnd_way;
   logic mshr_vld_d, mshr_vld_q, mshr_vld_q1;
+  logic mshr_cancel_d, mshr_cancel_q;
   logic mshr_allocate;
   logic update_lfsr, all_ways_valid;
 
@@ -157,6 +181,17 @@ module wt_dcache_missunit
 
   logic inv_vld, inv_vld_all, cl_write_en;
   logic load_ack, store_ack, amo_ack;
+  logic mem_inv_req, mem_inv_grant, snoop_inv_req, snoop_inv_grant, fill_grant;
+  logic inv_rr_d, inv_rr_q;
+  logic snoop_in_progress, snoop_in_progress_d;
+  logic snoop_accept;
+  logic [CVA6Cfg.PLEN-1:0] snoop_addr_d, snoop_addr_q;
+  logic [$clog2(CVA6Cfg.DCACHE_SET_ASSOC)-1:0] snoop_way_d, snoop_way_q;
+  logic snoop_inv_needed_d, snoop_inv_needed_q;
+  logic snoop_inv_done_d, snoop_inv_done_q;
+  logic snoop_inv_busy_d, snoop_inv_busy_q;
+  logic snoop_ca_needed_d, snoop_ca_needed_q;
+  logic snoop_ca_done_d, snoop_ca_done_q;
 
   logic [NumPorts-1:0] mshr_rdrd_collision_d, mshr_rdrd_collision_q;
   logic [NumPorts-1:0] mshr_rdrd_collision;
@@ -167,8 +202,20 @@ module wt_dcache_missunit
   ///////////////////////////////////////////////////////
 
   assign cache_en_o = enable_q;
+  assign flush_en = (state_q == FLUSH) && wr_cl_ready_i;
   assign cnt_d = (flush_en) ? cnt_q + 1 : (state_q == FLUSH) ? cnt_q : '0;
   assign flush_done = (cnt_q == CVA6Cfg.DCACHE_NUM_WORDS - 1);
+  assign snoop_ready_o = (snoop_state_q == SNOOP_IDLE) && !snoop_in_progress &&
+                         (state_q != FLUSH) && (state_q != FLUSH_WAIT) &&
+                         !flush_i && (enable_i == enable_q);
+  assign snoop_accept = snoop_valid_i && snoop_ready_o;
+  assign snoop_meta_query_req_o = snoop_state_q == SNOOP_QUERY_REQ;
+  assign snoop_meta_query_idx_o = snoop_addr_q[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH];
+  assign snoop_meta_query_tag_o =
+      snoop_addr_q[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_INDEX_WIDTH];
+  assign snoop_ca_invalidate_valid_o = (snoop_state_q == SNOOP_PROCESS) &&
+                                       snoop_ca_needed_q && !snoop_ca_done_q;
+  assign snoop_ca_invalidate_addr_o = snoop_addr_q;
 
   assign miss_req_masked_d = (lock_reqs)  ? miss_req_masked_q      :
                              (mask_reads) ? miss_we_i & miss_req_i : miss_req_i;
@@ -225,6 +272,21 @@ module wt_dcache_missunit
   assign mshr_d.repl_way      = (mshr_allocate) ? repl_way : mshr_q.repl_way;
   assign mshr_d.miss_port_idx = (mshr_allocate) ? miss_port_idx : mshr_q.miss_port_idx;
 
+  always_comb begin
+    mshr_cancel_d = mshr_cancel_q;
+    if (mshr_allocate) begin
+      mshr_cancel_d = snoop_accept &&
+                      (miss_paddr_i[miss_port_idx][CVA6Cfg.PLEN-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] ==
+                       snoop_addr_i[CVA6Cfg.PLEN-1:CVA6Cfg.DCACHE_OFFSET_WIDTH]);
+    end else if (load_ack) begin
+      mshr_cancel_d = 1'b0;
+    end else if (snoop_accept && mshr_vld_q &&
+                 (mshr_q.paddr[CVA6Cfg.PLEN-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] ==
+                  snoop_addr_i[CVA6Cfg.PLEN-1:CVA6Cfg.DCACHE_OFFSET_WIDTH])) begin
+      mshr_cancel_d = 1'b1;
+    end
+  end
+
   // currently we only have one outstanding read TX, hence an incoming load clears the MSHR
   assign mshr_vld_d           = (mshr_allocate) ? 1'b1 : (load_ack) ? 1'b0 : mshr_vld_q;
 
@@ -239,6 +301,72 @@ module wt_dcache_missunit
   // read/write collision, stalls the corresponding request
   // write port[NumPorts-1] collides with MSHR_Q
   assign mshr_rdwr_collision = (mshr_q.paddr[CVA6Cfg.PLEN-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] == miss_paddr_i[NumPorts-1][CVA6Cfg.PLEN-1:CVA6Cfg.DCACHE_OFFSET_WIDTH]) && mshr_vld_q;
+
+  assign snoop_inv_req = snoop_in_progress && snoop_inv_needed_q &&
+                         !snoop_inv_done_q && !snoop_inv_busy_q;
+
+  always_comb begin : p_snoop_fsm
+    snoop_state_d = snoop_state_q;
+    snoop_in_progress_d = snoop_in_progress;
+    snoop_addr_d = snoop_addr_q;
+    snoop_way_d = snoop_way_q;
+    snoop_inv_needed_d = snoop_inv_needed_q;
+    snoop_inv_done_d = snoop_inv_done_q;
+    snoop_inv_busy_d = snoop_inv_busy_q;
+    snoop_ca_needed_d = snoop_ca_needed_q;
+    snoop_ca_done_d = snoop_ca_done_q;
+    snoop_ack_o = 1'b0;
+
+    unique case (snoop_state_q)
+      SNOOP_IDLE: begin
+        if (snoop_accept) begin
+          snoop_state_d = SNOOP_QUERY_REQ;
+          snoop_in_progress_d = 1'b1;
+          snoop_addr_d = snoop_addr_i;
+          snoop_inv_needed_d = 1'b0;
+          snoop_inv_done_d = 1'b0;
+          snoop_inv_busy_d = 1'b0;
+          snoop_ca_needed_d = 1'b1;
+          snoop_ca_done_d = 1'b0;
+        end
+      end
+      SNOOP_QUERY_REQ: begin
+        if (snoop_meta_query_ready_i) begin
+          snoop_state_d = SNOOP_QUERY_WAIT;
+        end
+      end
+      SNOOP_QUERY_WAIT: begin
+        if (snoop_meta_query_valid_i) begin
+          snoop_way_d = snoop_meta_query_way_i;
+          snoop_inv_needed_d = snoop_meta_query_match_i;
+          snoop_inv_done_d = !snoop_meta_query_match_i;
+          snoop_state_d = SNOOP_PROCESS;
+        end
+      end
+      SNOOP_PROCESS: begin
+        if (snoop_ca_invalidate_valid_o && snoop_ca_invalidate_ack_i) begin
+          snoop_ca_done_d = 1'b1;
+        end
+        if (snoop_inv_grant) begin
+          snoop_inv_busy_d = 1'b1;
+        end
+        if (snoop_inv_busy_q && wr_cl_ready_i) begin
+          snoop_inv_busy_d = 1'b0;
+          snoop_inv_done_d = 1'b1;
+        end
+        if ((!snoop_inv_needed_d || snoop_inv_done_d) &&
+            (!snoop_ca_needed_d || snoop_ca_done_d)) begin
+          snoop_ack_o = 1'b1;
+          snoop_in_progress_d = 1'b0;
+          snoop_state_d = SNOOP_IDLE;
+        end
+      end
+      default: begin
+        snoop_state_d = SNOOP_IDLE;
+        snoop_in_progress_d = 1'b0;
+      end
+    endcase
+  end
 
   // read collides with inflight TX
   always_comb begin : p_tx_coll
@@ -367,6 +495,34 @@ module wt_dcache_missunit
                              (store_sent)              ? stores_inflight_q + 1 :
                                                          stores_inflight_q;
 
+  assign mem_inv_req = mem_rtrn_vld_i && (mem_rtrn_i.rtype == DCACHE_INV_REQ);
+
+  always_comb begin : p_cacheline_write_arb
+    mem_inv_grant = 1'b0;
+    snoop_inv_grant = 1'b0;
+    fill_grant = 1'b0;
+    inv_rr_d = inv_rr_q;
+
+    if (!flush_en && wr_cl_ready_i) begin
+      if (mem_inv_req && snoop_inv_req) begin
+        if (inv_rr_q) begin
+          snoop_inv_grant = 1'b1;
+        end else begin
+          mem_inv_grant = 1'b1;
+        end
+      end else if (snoop_inv_req) begin
+        snoop_inv_grant = 1'b1;
+      end else if (mem_inv_req) begin
+        mem_inv_grant = 1'b1;
+      end else begin
+        fill_grant = 1'b1;
+      end
+    end
+
+    if (mem_inv_grant) inv_rr_d = 1'b1;
+    if (snoop_inv_grant) inv_rr_d = 1'b0;
+  end
+
   // incoming responses
   always_comb begin : p_rtrn_logic
     load_ack        = 1'b0;
@@ -380,7 +536,7 @@ module wt_dcache_missunit
     if (mem_rtrn_vld_i) begin
       unique case (mem_rtrn_i.rtype)
         DCACHE_LOAD_ACK: begin
-          if (mshr_vld_q && wr_cl_ready_i) begin
+          if (mshr_vld_q && fill_grant) begin
             load_ack = 1'b1;
             miss_rtrn_vld_o[mshr_q.miss_port_idx] = 1'b1;
           end
@@ -408,10 +564,8 @@ module wt_dcache_missunit
           end
         end
         DCACHE_INV_REQ: begin
-          if (wr_cl_ready_i) begin
-            inv_vld     = mem_rtrn_i.inv.vld | mem_rtrn_i.inv.all;
-            inv_vld_all = mem_rtrn_i.inv.all;
-          end
+          inv_vld     = mem_inv_grant && (mem_rtrn_i.inv.vld | mem_rtrn_i.inv.all);
+          inv_vld_all = mem_inv_grant && mem_rtrn_i.inv.all;
         end
         // TODO:
         // DCACHE_INT_REQ: begin
@@ -426,8 +580,8 @@ module wt_dcache_missunit
     mem_rtrn_ready_o = 1'b1;
     if (mem_rtrn_vld_i) begin
       case (mem_rtrn_i.rtype)
-        DCACHE_LOAD_ACK: mem_rtrn_ready_o = wr_cl_ready_i;
-        DCACHE_INV_REQ: mem_rtrn_ready_o = wr_cl_ready_i;
+        DCACHE_LOAD_ACK: mem_rtrn_ready_o = fill_grant;
+        DCACHE_INV_REQ: mem_rtrn_ready_o = mem_inv_grant;
         default: ;
       endcase
     end
@@ -442,9 +596,11 @@ module wt_dcache_missunit
 
   // cacheline write port
   assign wr_cl_nc_o = mshr_q.nc;
-  assign wr_cl_vld_o = cl_write_en | (|wr_cl_we_o);
+  assign wr_cl_vld_o = flush_en | snoop_inv_grant | (|wr_cl_we_o);
 
-  assign wr_cl_we_o = (flush_en) ? '1 : (inv_vld_all) ? '1 : (inv_vld) ? dcache_way_bin2oh(
+  assign wr_cl_we_o = (flush_en) ? '1 : (snoop_inv_grant) ? dcache_way_bin2oh(
+      snoop_way_q
+  ) : (inv_vld_all) ? '1 : (inv_vld) ? dcache_way_bin2oh(
       mem_rtrn_i.inv.way
   ) : (cl_write_en) ? dcache_way_bin2oh(
       mshr_q.repl_way
@@ -456,18 +612,25 @@ module wt_dcache_missunit
   assign wr_ca_tag_bits_o = (cl_write_en && mshr_q.ca_line) ?
       dcache_way_bin2oh(mshr_q.repl_way) : '0;
 
-  assign wr_cl_idx_o     = (flush_en) ? cnt_q                                                        :
-                           (inv_vld)  ? mem_rtrn_i.inv.idx[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] :
-                                        mshr_q.paddr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH];
+  assign wr_cl_idx_o = (flush_en) ? cnt_q :
+                       (snoop_inv_grant) ?
+                           snoop_addr_q[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] :
+                       (inv_vld) ?
+                           mem_rtrn_i.inv.idx[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] :
+                           mshr_q.paddr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH];
 
-  assign wr_cl_tag_o = mshr_q.paddr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_INDEX_WIDTH];
-  assign wr_cl_off_o = mshr_q.paddr[CVA6Cfg.DCACHE_OFFSET_WIDTH-1:0];
+  assign wr_cl_tag_o = (snoop_inv_grant) ? snoop_meta_query_tag_o :
+                       mshr_q.paddr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_INDEX_WIDTH];
+  assign wr_cl_off_o = (snoop_inv_grant) ? snoop_addr_q[CVA6Cfg.DCACHE_OFFSET_WIDTH-1:0] :
+                       mshr_q.paddr[CVA6Cfg.DCACHE_OFFSET_WIDTH-1:0];
   assign wr_cl_data_o = mem_rtrn_i.data;
   assign wr_cl_user_o = mem_rtrn_i.user;
   assign wr_cl_data_be_o = (cl_write_en) ? '1 : '0;// we only write complete cachelines into the memory
 
-  // only non-NC responses write to the cache
-  assign cl_write_en = load_ack & ~mshr_q.nc;
+  assign cl_write_en = load_ack & ~mshr_q.nc & ~mshr_cancel_q &
+                       !(snoop_accept && mshr_vld_q &&
+                         (mshr_q.paddr[CVA6Cfg.PLEN-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] ==
+                          snoop_addr_i[CVA6Cfg.PLEN-1:CVA6Cfg.DCACHE_OFFSET_WIDTH]));
 
   ///////////////////////////////////////////////////////
   // main control logic for generating tx
@@ -486,7 +649,6 @@ module wt_dcache_missunit
     // disabling cache is possible anytime, enabling goes via flush
     enable_d         = enable_q & enable_i;
     flush_ack_d      = flush_ack_q;
-    flush_en         = 1'b0;
     amo_sel          = 1'b0;
     update_lfsr      = 1'b0;
     mshr_allocate    = 1'b0;
@@ -499,7 +661,7 @@ module wt_dcache_missunit
       // wait for misses / amo ops
       IDLE: begin
         if (flush_i || (enable_i && !enable_q)) begin
-          if (wbuffer_empty_i && !mshr_vld_q) begin
+          if (wbuffer_empty_i && !mshr_vld_q && !snoop_in_progress) begin
             flush_ack_d = flush_i;
             state_d     = FLUSH;
           end else begin
@@ -576,15 +738,13 @@ module wt_dcache_missunit
           mem_data_o.rtype = DCACHE_STORE_REQ;
         end
 
-        if (wbuffer_empty_i && !mshr_vld_q) begin
+        if (wbuffer_empty_i && !mshr_vld_q && !snoop_in_progress) begin
           state_d = IDLE;
         end
       end
       //////////////////////////////////
       // flush the cache
       FLUSH: begin
-        // internal flush signal
-        flush_en = wr_cl_ready_i;
         if (flush_done && wr_cl_ready_i) begin
           state_d = FLUSH_WAIT;
         end
@@ -643,11 +803,22 @@ module wt_dcache_missunit
       flush_ack_q           <= '0;
       mshr_vld_q            <= '0;
       mshr_vld_q1           <= '0;
+      mshr_cancel_q         <= 1'b0;
       mshr_q                <= '0;
       mshr_rdrd_collision_q <= '0;
       miss_req_masked_q     <= '0;
       amo_req_q             <= '0;
       stores_inflight_q     <= '0;
+      inv_rr_q              <= 1'b0;
+      snoop_state_q         <= SNOOP_IDLE;
+      snoop_in_progress     <= 1'b0;
+      snoop_addr_q          <= '0;
+      snoop_way_q           <= '0;
+      snoop_inv_needed_q    <= 1'b0;
+      snoop_inv_done_q      <= 1'b0;
+      snoop_inv_busy_q      <= 1'b0;
+      snoop_ca_needed_q     <= 1'b0;
+      snoop_ca_done_q       <= 1'b0;
     end else begin
       state_q               <= state_d;
       cnt_q                 <= cnt_d;
@@ -655,11 +826,22 @@ module wt_dcache_missunit
       flush_ack_q           <= flush_ack_d;
       mshr_vld_q            <= mshr_vld_d;
       mshr_vld_q1           <= mshr_vld_q;
+      mshr_cancel_q         <= mshr_cancel_d;
       mshr_q                <= mshr_d;
       mshr_rdrd_collision_q <= mshr_rdrd_collision_d;
       miss_req_masked_q     <= miss_req_masked_d;
       amo_req_q             <= amo_req_d;
       stores_inflight_q     <= stores_inflight_d;
+      inv_rr_q              <= inv_rr_d;
+      snoop_state_q         <= snoop_state_d;
+      snoop_in_progress     <= snoop_in_progress_d;
+      snoop_addr_q          <= snoop_addr_d;
+      snoop_way_q           <= snoop_way_d;
+      snoop_inv_needed_q    <= snoop_inv_needed_d;
+      snoop_inv_done_q      <= snoop_inv_done_d;
+      snoop_inv_busy_q      <= snoop_inv_busy_d;
+      snoop_ca_needed_q     <= snoop_ca_needed_d;
+      snoop_ca_done_q       <= snoop_ca_done_d;
     end
   end
 

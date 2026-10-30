@@ -53,6 +53,10 @@ module wt_cache_subsystem
     // Cache management
     input logic dcache_enable_i,  // from CSR
     input logic dcache_flush_i,  // high until acknowledged
+    input logic snoop_valid_i,
+    input logic [CVA6Cfg.PLEN-1:0] snoop_addr_i,  // line-aligned physical address
+    output logic snoop_ready_o,
+    output logic snoop_ack_o,
     output logic                           dcache_flush_ack_o,     // send a single cycle acknowledge signal when the cache is flushed
     input logic ca_flush_i,
     input logic [CVA6Cfg.NrCommitPorts-1:0] ca_commit_valid_i,
@@ -176,6 +180,10 @@ module wt_cache_subsystem
       .rst_ni          (rst_ni),
       .enable_i        (dcache_enable_i),
       .flush_i         (dcache_flush_i),
+      .snoop_valid_i   (snoop_valid_i),
+      .snoop_addr_i    (snoop_addr_i),
+      .snoop_ready_o   (snoop_ready_o),
+      .snoop_ack_o     (snoop_ack_o),
       .flush_ack_o     (dcache_flush_ack_o),
       .ca_flush_i      (ca_flush_i),
       .ca_commit_valid_i(ca_commit_valid_i),
