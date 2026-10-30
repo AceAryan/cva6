@@ -483,6 +483,9 @@ module decoder
               instruction_o.fu  = STORE;
               instruction_o.op  = ariane_pkg::CWRITE;
               instruction_o.rs2 = instr.stype.rs2;
+              // S-type: bits [11:7] are imm[4:0], not a destination; the
+              // outcome is reported through the cafail CSR
+              instruction_o.rd  = '0;
               imm_select        = SIMM;
             end
             default: illegal_instr = 1'b1;

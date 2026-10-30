@@ -28,6 +28,12 @@ The `ca-snoop` branch adds "conditional access" to the WT D-cache (`core/cache_s
 - **Rule for future changes.** A cache must be able to answer a snoop without needing the bus.
 - **`cc_bus.sv`** is an atomic broadcast bus. Cacheable AMOs and LR/SC execute in the L1 under a GetM tenure. An LR keeps its tenure up to `LrHoldCycles` cycles waiting for its SC, which guarantees forward progress.
 - **`cva6` parameter `CoherentL1`.** When 1, the cache uses the core's `cc_*`/`snoop_*` ports. When 0, it is tied off. `ariane.sv` always ties them off.
+- **Conditional access on the write-back cache** (`ca_tag_set.sv`, paper arXiv 2302.12958):
+  - `cread` (custom-0, funct3 0) and `untagOne`/`untagAll` (custom-1, funct3 0/1) go through the load port. They are recorded by `trans_id` and take effect at commit.
+  - `cwrite` (custom-0, funct3 1) runs at commit as `AMO_CWRITE`, so its check and store are atomic.
+  - Failure is reported in CSR 0xCC0: bit 0 CAFAIL, bit 1 accessRevokedBit. Software tests bit 0.
+  - Access is revoked by a GetM snoop hit, an eviction or flush, tagSet overflow (8), or a trap.
+  - While an untagAll is pending, no CA request is accepted.
 - **Two-core simulation.** Define `CVA6_2CORE` (`make verilate ... defines=CVA6_2CORE`). Without it, `ariane_soc_pkg` and `ariane_testharness` are unchanged.
 - **Ground rules from `plan.md`.** Never commit or push, add no Co-authored-by trailers, and put all logs under `~/logs`.
 
@@ -67,7 +73,16 @@ Optional plusargs:
 - `+axidebug`: AXI beats
 - `+watch=<hex addr>`: every event on one line
 
-Two-cache MSI testbench: the file list is at `~/logs/phase2/std_nbdcache_2core_tb.f`, top module `std_nbdcache_2core_tb`. Run it with `+seed=N +nrandom=1500 [+hot]`.
+Two-cache MSI and CA testbench:
+- The file list is at `~/logs/phase3/std_nbdcache_2core_tb.f`, top module `std_nbdcache_2core_tb`.
+- Run it with `+seed=N +nrandom=1500 [+hot]`.
+- Debug plusargs: `+cadebug`, `+catrace`.
+- Verilator 5.032 asserts (`VlForkSync::join`) on some fork/join sequences, so parallel agents use worker processes (`run_workers`), not fork.
+- Phase 1 TB file list for the current RTL: `~/logs/phase3/std_nbdcache_msi_tb.f`.
+
+Full-system tests (bare metal, rv32ima; `riscv64-unknown-elf-gcc -march=rv32ima_zicsr -mabi=ilp32 -nostdlib -nostartfiles -T <dir>/link.ld`):
+- `verif/tests/custom/msi_2core/` (coherence)
+- `verif/tests/custom/ca_2core/` (conditional access)
 
 Full-core Verilator models. Spike is in `tools/spike`, and the rv32 riscv-tests are built in `verif/tests/riscv-tests/isa`.
 

@@ -217,7 +217,9 @@ module csr_regfile
     output logic sdtrig_commit_icount_valid_o,
     output logic [$clog2(CVA6Cfg.NrCommitPorts)-1:0] sdtrig_commit_icount_nr_instr_o,
     output logic [CVA6Cfg.XLEN-1:0] sdtrig_commit_action_o,
-    output logic sdtrig_commit_std_exception_valid_o
+    output logic sdtrig_commit_std_exception_valid_o,
+    // Conditional access status for the cafail CSR - CACHE
+    input logic [1:0] ca_status_i
 );
   localparam logic [63:0] SMODE_STATUS_READ_MASK = ariane_pkg::smode_status_read_mask(CVA6Cfg);
   localparam logic [63:0] HS_DELEG_INTERRUPTS = {
@@ -889,6 +891,8 @@ module csr_regfile
         // custom (non RISC-V) cache control
         riscv::CSR_DCACHE: csr_rdata = dcache_q;
         riscv::CSR_ICACHE: csr_rdata = icache_q;
+        // conditional access status, read-only (writes take the default illegal path)
+        riscv::CSR_CAFAIL: csr_rdata = {{CVA6Cfg.XLEN - 2{1'b0}}, ca_status_i};
         // custom (non RISC-V) accelerator memory consistency mode
         riscv::CSR_ACC_CONS: begin
           if (CVA6Cfg.EnableAccelerator) begin

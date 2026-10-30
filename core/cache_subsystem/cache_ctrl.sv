@@ -60,7 +60,16 @@ module cache_ctrl
     // check MSHR for aliasing
     output logic [55:0] mshr_addr_o,
     input logic mshr_addr_matches_i,
-    input logic mshr_index_matches_i
+    input logic mshr_index_matches_i,
+    // conditional access (only the load port carries CA operations)
+    input logic ca_block_i,  // an untagAll is pending: accept no CA operation
+    input logic ca_revoked_i,  // a cread answered now fails
+    output logic ca_issue_o,  // a CA operation got its physical address
+    output wt_cache_pkg::ca_op_t ca_issue_op_o,
+    output logic [CVA6Cfg.TRANS_ID_BITS-1:0] ca_issue_id_o,
+    output logic [CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:0] ca_issue_addr_o,
+    output logic ca_fail_o,  // this cread failed: it returns 0
+    output logic [CVA6Cfg.TRANS_ID_BITS-1:0] ca_fail_id_o
 );
 
   enum logic [3:0] {
@@ -88,6 +97,9 @@ module cache_ctrl
     logic [CVA6Cfg.XLEN-1:0]               wdata;
     logic                                  bypass;
     logic                                  killed;
+    wt_cache_pkg::ca_op_t                  ca_op;
+    logic [CVA6Cfg.TRANS_ID_BITS-1:0]      ca_id;
+    logic                                  ca_issued;
   } mem_req_t;
 
   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] hit_way_d, hit_way_q;
@@ -99,6 +111,11 @@ module cache_ctrl
 
   logic [CVA6Cfg.DCACHE_LINE_WIDTH-1:0] cl_i;
   logic hit_owned;  // the hit line is in M and may be written
+  logic ca_accept_ok;  // a new request may be taken as far as CA ordering goes
+  logic ca_untag;  // the current request is untagOne/untagAll: no memory access
+
+  assign ca_accept_ok = !(req_port_i.ca_op != wt_cache_pkg::CA_NONE && ca_block_i);
+  assign ca_untag = mem_req_q.ca_op inside {wt_cache_pkg::CA_UNTAG_ONE, wt_cache_pkg::CA_UNTAG_ALL};
 
   always_comb begin : way_select
     cl_i = '0;
@@ -136,6 +153,12 @@ module cache_ctrl
     req_port_o.data_ruser = '0;
     miss_req_o = '0;
     mshr_addr_o = '0;
+    ca_issue_o = 1'b0;
+    ca_issue_op_o = mem_req_q.ca_op;
+    ca_issue_id_o = mem_req_q.ca_id;
+    ca_issue_addr_o = {req_port_i.address_tag, mem_req_q.index};
+    ca_fail_o = 1'b0;
+    ca_fail_id_o = mem_req_q.ca_id;
     // Memory array communication
     req_o = '0;
     addr_o = req_port_i.address_index;
@@ -149,9 +172,12 @@ module cache_ctrl
 
       IDLE: begin
         // a new request arrived
-        if (req_port_i.data_req && !flush_i) begin
+        if (req_port_i.data_req && !flush_i && ca_accept_ok) begin
           // request the cache line - we can do this speculatively
           req_o = '1;
+          mem_req_d.ca_op = req_port_i.ca_op;
+          mem_req_d.ca_id = req_port_i.ca_id;
+          mem_req_d.ca_issued = 1'b0;
 
           // save index, be and we
           mem_req_d.index = req_port_i.address_index;
@@ -191,10 +217,23 @@ module cache_ctrl
           if (state_q != WAIT_TAG_SAVED) begin
             mem_req_d.tag = req_port_i.address_tag;
           end
+          // record the CA operation with its physical line address
+          if (mem_req_q.ca_op != wt_cache_pkg::CA_NONE && !mem_req_q.ca_issued) begin
+            ca_issue_o = 1'b1;
+            ca_issue_addr_o = {mem_req_d.tag, mem_req_q.index};
+            mem_req_d.ca_issued = 1'b1;
+          end
           // we speculatively request another transfer
           if (req_port_i.data_req && !flush_i) begin
             req_o = '1;
           end
+          // ------------
+          // UNTAG: no memory access, done
+          // ------------
+          if (ca_untag) begin
+            req_port_o.data_rvalid = ~mem_req_q.killed;
+            state_d = IDLE;
+          end else
           // ------------
           // HIT CASE
           // ------------
@@ -203,8 +242,11 @@ module cache_ctrl
           // refetched for a store that has already been granted.
           if (|hit_way_i && (!mem_req_q.we || hit_owned) && !mshr_addr_matches_i) begin
             // we can request another cache-line if this was a load
-            if (req_port_i.data_req && !mem_req_q.we && !flush_i) begin
+            if (req_port_i.data_req && !mem_req_q.we && !flush_i && ca_accept_ok) begin
               state_d             = WAIT_TAG;  // switch back to WAIT_TAG
+              mem_req_d.ca_op     = req_port_i.ca_op;
+              mem_req_d.ca_id     = req_port_i.ca_id;
+              mem_req_d.ca_issued = 1'b0;
               mem_req_d.index     = req_port_i.address_index;
               mem_req_d.id        = req_port_i.data_id;
               mem_req_d.be        = req_port_i.data_be;
@@ -262,14 +304,14 @@ module cache_ctrl
           //    content we've written so far. This as a consequence
           //    means we can't have hit on the CL which mean the
           //    req_port_o.data_rvalid will be de-asserted.
-          if ((mshr_index_matches_i && mem_req_q.we) || mshr_addr_matches_i) begin
+          if (!ca_untag && ((mshr_index_matches_i && mem_req_q.we) || mshr_addr_matches_i)) begin
             state_d = WAIT_MSHR;
           end
 
           // -------------------------
           // Check for cache-ability
           // -------------------------
-          if (!config_pkg::is_inside_cacheable_regions(
+          if (!ca_untag && !config_pkg::is_inside_cacheable_regions(
                   CVA6Cfg, {{{64 - CVA6Cfg.PLEN} {1'b0}}, tag_o, {CVA6Cfg.DCACHE_INDEX_WIDTH{1'b0}}}
               )) begin
             mem_req_d.bypass = 1'b1;
@@ -299,6 +341,10 @@ module cache_ctrl
         if (req_port_i.tag_valid) begin
           mem_req_d.tag = req_port_i.address_tag;
           state_d = WAIT_GNT_SAVED;
+          if (mem_req_q.ca_op != wt_cache_pkg::CA_NONE && !mem_req_q.ca_issued) begin
+            ca_issue_o = 1'b1;
+            mem_req_d.ca_issued = 1'b1;
+          end
         end
 
         // we have a memory grant again ~> go back to WAIT_TAG
@@ -362,6 +408,14 @@ module cache_ctrl
           // save tag
           mem_req_d.tag = req_port_i.address_tag;
           state_d = WAIT_REFILL_GNT;
+          if (mem_req_q.ca_op != wt_cache_pkg::CA_NONE) begin
+            ca_issue_o = 1'b1;
+            mem_req_d.ca_issued = 1'b1;
+          end
+          if (ca_untag) begin
+            req_port_o.data_rvalid = 1'b1;
+            state_d = IDLE;
+          end
         end
       end
 
@@ -417,8 +471,11 @@ module cache_ctrl
           req_port_o.data_rvalid = ~mem_req_q.killed;
           req_port_o.data_rdata  = critical_word_i[axi_offset+:CVA6Cfg.XLEN];
           // we can make another request
-          if (req_port_i.data_req && !flush_i) begin
+          if (req_port_i.data_req && !flush_i && ca_accept_ok) begin
             // save index, be and we
+            mem_req_d.ca_op = req_port_i.ca_op;
+            mem_req_d.ca_id = req_port_i.ca_id;
+            mem_req_d.ca_issued = 1'b0;
             mem_req_d.index = req_port_i.address_index;
             mem_req_d.id    = req_port_i.data_id;
             mem_req_d.be    = req_port_i.data_be;
@@ -453,6 +510,16 @@ module cache_ctrl
       default: ;
 
     endcase
+
+    // a cread is answered with the check of this very cycle: when access is
+    // revoked it returns 0 and its failure is recorded for the cafail CSR
+    if (req_port_o.data_rvalid && mem_req_q.ca_op == wt_cache_pkg::CA_CREAD) begin
+      if (ca_revoked_i) begin
+        req_port_o.data_rdata = '0;
+        ca_fail_o = !mem_req_q.killed;
+      end
+    end
+    if (ca_untag) req_port_o.data_rdata = '0;
 
     if (req_port_i.kill_req) begin
       req_port_o.data_rvalid = 1'b1;

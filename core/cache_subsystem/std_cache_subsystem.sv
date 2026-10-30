@@ -70,7 +70,13 @@ module std_cache_subsystem
     output logic cc_done_o,
     input cc_snoop_t snoop_i,
     output logic snoop_ready_o,
-    output logic snoop_ack_o
+    output logic snoop_ack_o,
+    // conditional access
+    input logic ca_flush_i,
+    input logic [CVA6Cfg.NrCommitPorts-1:0] ca_commit_valid_i,
+    input logic [CVA6Cfg.NrCommitPorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] ca_commit_id_i,
+    input logic ca_trap_i,
+    output logic [1:0] ca_status_o
 );
 
   assign wbuffer_empty_o = 1'b1;
@@ -139,7 +145,12 @@ module std_cache_subsystem
       .cc_done_o,
       .snoop_i,
       .snoop_ready_o,
-      .snoop_ack_o
+      .snoop_ack_o,
+      .ca_flush_i,
+      .ca_commit_valid_i,
+      .ca_commit_id_i,
+      .ca_trap_i,
+      .ca_status_o
   );
 
   // -----------------------

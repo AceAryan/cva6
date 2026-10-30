@@ -131,7 +131,12 @@ module std_nbdcache_msi_tb;
       .cc_done_o    (cc_done),
       .snoop_i      (snoop),
       .snoop_ready_o(snoop_ready),
-      .snoop_ack_o  (snoop_ack)
+      .snoop_ack_o  (snoop_ack),
+      .ca_flush_i       (1'b0),
+      .ca_commit_valid_i('0),
+      .ca_commit_id_i   ('0),
+      .ca_trap_i        (1'b0),
+      .ca_status_o      ()
   );
 
   // ------------------

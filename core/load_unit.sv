@@ -687,7 +687,9 @@ module load_unit
         end
       end
     endcase
-    if (ldbuf_rdata.operation == ariane_pkg::CREAD) begin
+    // the write-through cache reports a failed cread in bit 0; the write-back
+    // cache returns 0 and records the failure in the cafail CSR instead
+    if (ldbuf_rdata.operation == ariane_pkg::CREAD && CVA6Cfg.DCacheType == config_pkg::WT) begin
       result_o[0] = ca_access_revoked_i;
     end
   end

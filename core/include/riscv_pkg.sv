@@ -641,6 +641,10 @@ package riscv;
     CSR_MHPM_COUNTER_29H = 12'hB9D,  // reserved
     CSR_MHPM_COUNTER_30H = 12'hB9E,  // reserved
     CSR_MHPM_COUNTER_31H = 12'hB9F,  // reserved
+    // Conditional access status (custom user read-only):
+    //   bit 0 CAFAIL (a cread/cwrite failed since the last untagAll)
+    //   bit 1 accessRevokedBit
+    CSR_CAFAIL           = 12'hCC0,
     // Cache Control (platform specifc)
     CSR_DCACHE           = 12'h7C1,
     CSR_ICACHE           = 12'h7C0,

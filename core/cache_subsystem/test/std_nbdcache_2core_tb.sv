@@ -99,6 +99,25 @@ module std_nbdcache_2core_tb;
   logic [NC-1:0] snoop_ready, snoop_ack;
   logic bus_busy;
   logic [0:0] bus_owner;
+  // conditional access: the TB plays the commit stage
+  localparam int unsigned ID_W = CVA6Cfg.TRANS_ID_BITS;
+  logic [NC-1:0] ca_flush, ca_trap;
+  logic [CVA6Cfg.NrCommitPorts-1:0] ca_commit_valid[NC];
+  logic [CVA6Cfg.NrCommitPorts-1:0][ID_W-1:0] ca_commit_id[NC];
+  logic [1:0] ca_status[NC];  // {accessRevokedBit, CAFAIL}
+  logic [NC-1:0] probe_ca_fail;  // the load port answered a cread with a failure
+  logic [NC-1:0] probe_ca_gnt;
+  cc_snoop_t probe_snoop_q[NC];  // the snoop a cache is serving
+  logic [7:0] probe_tag_valid[NC];  // hardware tagSet (debug)
+  logic [7:0][CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:0] probe_tag_addr[NC];
+
+  function automatic string ca_dump(input int c);
+    string str = "hw:";
+    for (int i = 0; i < 8; i++) if (probe_tag_valid[c][i]) str = {str, $sformatf(" %h", probe_tag_addr[c][i])};
+    str = {str, " model:"};
+    foreach (tb_tag[c][l]) str = {str, $sformatf(" %h", l)};
+    return str;
+  endfunction
 
   for (genvar c = 0; c < NC; c++) begin : gen_core
     std_nbdcache #(
@@ -128,8 +147,17 @@ module std_nbdcache_2core_tb;
         .cc_done_o    (cc_done[c]),
         .snoop_i      (snoop[c]),
         .snoop_ready_o(snoop_ready[c]),
-        .snoop_ack_o  (snoop_ack[c])
+        .snoop_ack_o  (snoop_ack[c]),
+        .ca_flush_i       (ca_flush[c]),
+        .ca_commit_valid_i(ca_commit_valid[c]),
+        .ca_commit_id_i   (ca_commit_id[c]),
+        .ca_trap_i        (ca_trap[c]),
+        .ca_status_o      (ca_status[c])
     );
+    assign probe_ca_fail[c] = dut.ca_fail[1];
+    assign probe_snoop_q[c] = dut.i_miss_handler.snoop_q;
+    assign probe_tag_valid[c] = dut.i_ca_tag_set.tag_valid_q;
+    assign probe_tag_addr[c] = dut.i_ca_tag_set.tag_addr_q;
   end
 
   cc_bus #(
@@ -367,6 +395,13 @@ module std_nbdcache_2core_tb;
     end
   end
 
+  // last GetM snoop accepted by each cache (debug)
+  logic [63:0] last_getm_to[NC];
+  always @(posedge clk)
+    for (int c = 0; c < NC; c++)
+      if (snoop[c].valid && snoop_ready[c] && snoop[c].req_type == CC_GETM)
+        last_getm_to[c] <= {8'b0, snoop[c].addr};
+
   // fairness: a cache that keeps requesting is served before the other cache
   // gets a second tenure
   int unsigned skipped[NC];
@@ -396,6 +431,194 @@ module std_nbdcache_2core_tb;
   // Drivers
   // ------------------
   int unsigned n_ld[NC], n_st[NC], n_amo[NC], n_sc_ok[NC], n_sc_fail[NC];
+
+  // ------------------
+  // Conditional access model (Singh/Brown/Spear semantics)
+  // ------------------
+  // tagged line -> number of writes by the other core when it was tagged
+  int unsigned tb_tag[NC][logic [63:0]];
+  // the paper revokes on invalidation, not on a changed value: GetM snoops
+  // served by each cache, per line, and their count when the line was tagged
+  int unsigned remote_getm[NC][logic [63:0]];
+  int unsigned tb_tag_getm[NC][logic [63:0]];
+  bit tb_revoked_known[NC];  // a trap or tagSet overflow revoked access
+  int unsigned snap_getm[NC][logic [CVA6Cfg.TRANS_ID_BITS-1:0]];  // GetM count at a cread's response
+  bit last_cwrite_failed[NC];
+  int unsigned ca_id_cnt[NC];
+  int unsigned n_cread_ok[NC], n_cread_fail[NC], n_cwrite_ok[NC], n_cwrite_fail[NC];
+  int unsigned n_ca_spurious[NC];  // failures the model cannot explain (evictions)
+  localparam int unsigned CA_DEPTH = 8;
+
+  // the paper's guarantee: once another core wrote a tagged line (or access
+  // was revoked otherwise) every cread/cwrite fails until untagAll
+  function automatic int unsigned getm_count(input int c, input logic [63:0] a);
+    return remote_getm[c].exists(line_of(a)) ? remote_getm[c][line_of(a)] : 0;
+  endfunction
+
+  function automatic bit ca_must_fail(input int c);
+    if (tb_revoked_known[c]) return 1;
+    foreach (tb_tag[c][l])
+    if (writes_by(1 - c, l) != tb_tag[c][l] || getm_count(c, l) != tb_tag_getm[c][l]) return 1;
+    return 0;
+  endfunction
+
+  // a GetM snoop acknowledged this cycle takes effect with this cycle's edge
+  initial begin
+    forever begin
+      @(negedge clk);
+      #1;
+      for (int c = 0; c < NC; c++)
+      if (rst_n && snoop_ack[c] && probe_snoop_q[c].req_type == CC_GETM) begin
+        automatic logic [63:0] l = line_of({8'b0, probe_snoop_q[c].addr});
+        remote_getm[c][l] = getm_count(c, l) + 1;
+        // revocation is sticky: a later untagOne does not undo it
+        if (tb_tag[c].exists(l)) tb_revoked_known[c] = 1;
+      end
+    end
+  end
+
+  task automatic ca_commit(input int c, input logic [ID_W-1:0] id);
+    @(negedge clk);
+    ca_commit_valid[c] = '0;
+    ca_commit_valid[c][0] = 1'b1;
+    ca_commit_id[c][0] = id;
+    @(negedge clk);
+    ca_commit_valid[c] = '0;
+  endtask
+
+  // cread / untagOne / untagAll through the load port; commit afterwards
+  // unless told otherwise (then the caller commits or squashes `id`)
+  task automatic do_ca(input int c, input wt_cache_pkg::ca_op_t op, input logic [63:0] addr,
+                       input bit commit, output logic [31:0] data, output bit failed,
+                       output logic [ID_W-1:0] id, output int unsigned snap);
+    int unsigned t;
+    int unsigned ver_lo;
+    logic [63:0] wa;
+    bit must_fail;
+    t = 0;
+    wa = {addr[63:2], 2'b00};
+    id = ID_W'(ca_id_cnt[c]++);
+    if (op == wt_cache_pkg::CA_CREAD) use_line(addr);
+    @(negedge clk);
+    req_ports_i[c][LdPort] = '0;
+    req_ports_i[c][LdPort].data_req = 1'b1;
+    req_ports_i[c][LdPort].address_index = addr[IDX_W-1:0];
+    req_ports_i[c][LdPort].data_be = '1;
+    req_ports_i[c][LdPort].data_size = 2'b10;
+    req_ports_i[c][LdPort].ca_op = op;
+    req_ports_i[c][LdPort].ca_id = id;
+    #1;
+    while (!req_ports_o[c][LdPort].data_gnt) begin
+      @(negedge clk);
+      #1;
+      wait_timeout(t, $sformatf("core %0d %s gnt %h", c, op.name(), addr));
+    end
+    hist_init(wa);
+    ver_lo = hist[wa].size() - 1;
+    @(negedge clk);
+    req_ports_i[c][LdPort].data_req = 1'b0;
+    req_ports_i[c][LdPort].tag_valid = 1'b1;
+    req_ports_i[c][LdPort].address_tag = addr[IDX_W+TAG_W-1:IDX_W];
+    #1;
+    while (!req_ports_o[c][LdPort].data_rvalid) begin
+      @(negedge clk);
+      req_ports_i[c][LdPort].tag_valid = 1'b0;
+      #1;
+      wait_timeout(t, $sformatf("core %0d %s rvalid %h", c, op.name(), addr));
+    end
+    data = req_ports_o[c][LdPort].data_rdata;
+    failed = probe_ca_fail[c];
+    must_fail = ca_must_fail(c);
+    // a GetM on a tagged line acknowledged in this very cycle revokes too
+    if (snoop_ack[c] && probe_snoop_q[c].req_type == CC_GETM &&
+        tb_tag[c].exists(line_of({8'b0, probe_snoop_q[c].addr})))
+      must_fail = 1;
+    // the cread is linearized here: later writes by the other core count
+    snap = writes_by(1 - c, addr);
+    snap_getm[c][id] = getm_count(c, addr);
+    if (op == wt_cache_pkg::CA_CREAD) begin
+      if (!failed) begin
+        automatic logic ok = 1'b0;
+        if (must_fail) error($sformatf("core %0d cread %h succeeded although access was revoked", c, addr));
+        for (int i = ver_lo; i < hist[wa].size(); i++) if (hist[wa][i] === data) ok = 1'b1;
+        if (!ok) error($sformatf("core %0d cread %h returned %h, expected %h or later", c, addr, data, hist[wa][ver_lo]));
+        n_cread_ok[c]++;
+      end else begin
+        if (data !== '0) error($sformatf("core %0d failed cread returned %h, not 0", c, data));
+        if (!must_fail) begin
+          n_ca_spurious[c]++;
+          if ($test$plusargs("cadebug"))
+            $display("[%0t] CADEBUG core %0d cread %h failed, model: tags=%0d known=%b, last snoop by bus to core %0d: %h %s",
+                     $time, c, addr, tb_tag[c].size(), tb_revoked_known[c], c, last_getm_to[c], ca_dump(c));
+        end
+        n_cread_fail[c]++;
+      end
+    end else if (failed || data !== '0) begin
+      error($sformatf("core %0d %s answered %h fail=%b", c, op.name(), data, failed));
+    end
+    @(negedge clk);
+    req_ports_i[c][LdPort] = '0;
+    if ($test$plusargs("catrace"))
+      $display("[%0t] CATRACE core %0d %s %h id=%0d failed=%b data=%h %s", $time, c, op.name(), addr, id,
+               failed, data, ca_dump(c));
+    if (commit) ca_committed(c, op, addr, failed, id, snap, 1);
+  endtask
+
+  // the model's view of a commit (when do_ca was told not to commit, the
+  // caller calls this with do_commit = 1 at the right time). The model is
+  // updated in the cycle the commit is presented, so that it takes effect
+  // with the same clock edge as in the hardware, where a commit is applied
+  // before a snoop invalidation of the same cycle.
+  task automatic ca_committed(input int c, input wt_cache_pkg::ca_op_t op, input logic [63:0] addr,
+                              input bit failed, input logic [ID_W-1:0] id, input int unsigned snap,
+                              input bit do_commit);
+    if (do_commit) begin
+      @(negedge clk);
+      ca_commit_valid[c] = '0;
+      ca_commit_valid[c][0] = 1'b1;
+      ca_commit_id[c][0] = id;
+    end
+    case (op)
+      wt_cache_pkg::CA_CREAD: begin
+        if (!failed && !tb_tag[c].exists(line_of(addr))) begin
+          if (tb_tag[c].size() == CA_DEPTH) tb_revoked_known[c] = 1;  // overflow
+          else begin
+            tb_tag[c][line_of(addr)] = snap;
+            tb_tag_getm[c][line_of(addr)] = snap_getm[c][id];
+            // invalidated between the access and the commit: revoked for good
+            if (writes_by(1 - c, addr) != snap || getm_count(c, addr) != snap_getm[c][id])
+              tb_revoked_known[c] = 1;
+          end
+        end
+      end
+      wt_cache_pkg::CA_UNTAG_ONE: if (tb_tag[c].exists(line_of(addr))) tb_tag[c].delete(line_of(addr));
+      wt_cache_pkg::CA_UNTAG_ALL: begin
+        tb_tag[c].delete();
+        tb_tag_getm[c].delete();
+        tb_revoked_known[c] = 0;
+      end
+      default: ;
+    endcase
+    if (do_commit) begin
+      @(negedge clk);
+      ca_commit_valid[c] = '0;
+    end
+    #1;
+    if (op == wt_cache_pkg::CA_CREAD && failed && !ca_status[c][0])
+      error($sformatf("core %0d CAFAIL not set after a failed cread", c));
+    // untagAll clears everything, unless another core already invalidated a
+    // newly tagged line in the meantime (nothing is tagged here, so no)
+    if (op == wt_cache_pkg::CA_UNTAG_ALL && ca_status[c] != 2'b00)
+      error($sformatf("core %0d status %b after untagAll", c, ca_status[c]));
+  endtask
+
+  task automatic do_trap(input int c);
+    @(negedge clk);
+    ca_trap[c] = 1'b1;
+    @(negedge clk);
+    ca_trap[c] = 1'b0;
+    if (tb_tag[c].size() != 0) tb_revoked_known[c] = 1;
+  endtask
 
   task automatic do_load(input int c, input logic [63:0] addr, output logic [31:0] data);
     int unsigned t;
@@ -531,6 +754,26 @@ module std_nbdcache_2core_tb;
         end
         tb_resv_line[c] = '1;
       end
+      AMO_CWRITE: begin
+        if (res == 0) begin
+          if (!tb_tag[c].exists(line_of(addr)))
+            error($sformatf("core %0d cwrite %h succeeded on an untagged line", c, addr));
+          if (ca_must_fail(c))
+            error($sformatf("core %0d cwrite %h succeeded although access was revoked", c, addr));
+          gold_write(c, wa, opb);
+          n_cwrite_ok[c]++;
+        end else begin
+          if (res != 1) error($sformatf("core %0d cwrite returned %h", c, res));
+          if (!ca_must_fail(c) && tb_tag[c].exists(line_of(addr))) begin
+            n_ca_spurious[c]++;
+            if ($test$plusargs("cadebug"))
+              $display("[%0t] CADEBUG core %0d cwrite %h failed, model: tags=%0d known=%b, last GetM snoop to core %0d: %h %s",
+                       $time, c, addr, tb_tag[c].size(), tb_revoked_known[c], c, last_getm_to[c], ca_dump(c));
+          end
+          n_cwrite_fail[c]++;
+        end
+        last_cwrite_failed[c] = (res != 0);
+      end
       default: begin
         if (res !== old)
           error($sformatf("core %0d %s %h returned %h, memory holds %h", c, op.name(), addr, res, old));
@@ -540,6 +783,11 @@ module std_nbdcache_2core_tb;
     n_amo[c]++;
     @(negedge clk);
     amo_req[c] = '0;
+    // a failed cwrite is non-speculative: CAFAIL is set right away
+    if (op == AMO_CWRITE && last_cwrite_failed[c]) begin
+      #1;
+      if (!ca_status[c][0]) error($sformatf("core %0d CAFAIL not set after a failed cwrite", c));
+    end
   endtask
 
   task automatic do_flush(input int c);
@@ -790,14 +1038,272 @@ module std_nbdcache_2core_tb;
       ld_active[c] = 0;
       st_active[c] = 0;
     end
+    run_workers('{default: 1'b0, 0: 1'b1, 1: 1'b1, 2: 1'b1}, n_ops, nsets, ntags);
+  endtask
+
+  // ------------------
+  // Conditional access tests
+  // ------------------
+  task automatic chk(input bit cond, input string msg);
+    if (!cond) error(msg);
+  endtask
+
+  task automatic cread(input int c, input logic [63:0] a, output bit failed);
+    logic [31:0] d;
+    logic [ID_W-1:0] id;
+    int unsigned sn;
+    do_ca(c, wt_cache_pkg::CA_CREAD, a, 1, d, failed, id, sn);
+  endtask
+
+  task automatic untag_all(input int c);
+    logic [31:0] d;
+    bit f;
+    logic [ID_W-1:0] id;
+    int unsigned sn;
+    do_ca(c, wt_cache_pkg::CA_UNTAG_ALL, BASE, 1, d, f, id, sn);
+  endtask
+
+  task automatic untag_one(input int c, input logic [63:0] a);
+    logic [31:0] d;
+    bit f;
+    logic [ID_W-1:0] id;
+    int unsigned sn;
+    do_ca(c, wt_cache_pkg::CA_UNTAG_ONE, a, 1, d, f, id, sn);
+  endtask
+
+  task automatic cwrite(input int c, input logic [63:0] a, input logic [31:0] v, output bit failed);
+    logic [31:0] r;
+    do_amo(c, AMO_CWRITE, a, v, r);
+    failed = (r != 0);
+  endtask
+
+  task automatic test_ca_directed();
+    logic [63:0] A, B, C, D, E;
+    logic [31:0] d;
+    bit f, fa, fb;
+    logic [ID_W-1:0] ida, idb, idu;
+    int unsigned sna, snb, snu;
+    bit cread_done;
+    A = la(60, 1);
+    B = la(61, 1);
+    C = la(62, 1);
+    D = la(63, 1);
+    $display("[%0t] T5: conditional access, directed", $time);
+
+    // CA1: creads tag, cwrite to a tagged line succeeds and writes memory
+    untag_all(0);
+    cread(0, A, f);
+    chk(!f, "CA1: cread A failed");
+    cread(0, B, f);
+    chk(!f, "CA1: cread B failed");
+    cwrite(0, A, 32'hca00_0001, f);
+    chk(!f, "CA1: cwrite A failed");
+    chk(ca_status[0] == 2'b00, "CA1: status not clear");
+    do_load(1, A, d);
+    chk(d == 32'hca00_0001, $sformatf("CA1: core 1 reads %h after the cwrite", d));
+
+    // CA3: another core reading a tagged line (GetS) does not revoke
+    cwrite(0, B, 32'hca00_0003, f);
+    chk(!f, "CA3: a remote read revoked access");
+
+    // CA2: another core writing a tagged line revokes: every cread/cwrite
+    // fails until untagAll
+    do_store(1, B, 32'hca00_0002);
+    cread(0, C, f);
+    chk(f, "CA2: cread succeeded after a tagged line was written");
+    cwrite(0, A, 32'hbad0_0002, f);
+    chk(f, "CA2: cwrite succeeded after a tagged line was written");
+    chk(ca_status[0] == 2'b11, $sformatf("CA2: status %b, expected 11", ca_status[0]));
+    untag_all(0);
+    cread(0, A, f);
+    chk(!f, "CA2: cread failed after untagAll");
+
+    // CA4: cwrite to an untagged line fails and writes nothing
+    untag_all(0);
+    cwrite(0, D, 32'hbad0_0004, f);
+    chk(f, "CA4: cwrite to an untagged line succeeded");
+    chk(ca_status[0] == 2'b01, $sformatf("CA4: status %b, expected 01", ca_status[0]));
+
+    // CA5: untagOne stops monitoring that line only
+    untag_all(0);
+    cread(0, A, f);
+    cread(0, B, f);
+    untag_one(0, A);
+    do_store(1, A, 32'hca00_0005);
+    cwrite(0, B, 32'hca00_0006, f);
+    chk(!f, "CA5: a write to an untagged (untagOne) line revoked access");
+    cwrite(0, A, 32'hbad0_0005, f);
+    chk(f, "CA5: cwrite to an untagOne'd line succeeded");
+
+    // CA6: more lines than the tagSet holds revokes (as an eviction would)
+    untag_all(0);
+    for (int i = 0; i <= CA_DEPTH; i++) begin
+      cread(0, la(64 + i, 1), f);
+      chk(!f, $sformatf("CA6: cread %0d failed before the overflow", i));
+    end
+    cread(0, la(64, 1), f);
+    chk(f, "CA6: cread succeeded after the tagSet overflowed");
+    chk(ca_status[0][1], "CA6: overflow did not revoke");
+
+    // CA7: evicting a tagged line revokes
+    untag_all(0);
+    E = la(80, 1);
+    cread(0, E, f);
+    chk(!f, "CA7: cread failed");
+    // the fill may still be in flight when the cread has answered
+    settle();
+    chk(state_of(0, E) != ST_I, "CA7: tagged line not cached after its cread");
+    for (int t = 2; t < 200 && state_of(0, E) != ST_I; t++) begin
+      do_load(0, la(80, t), d);
+      settle();
+    end
+    chk(state_of(0, E) == ST_I, "CA7: tagged line never evicted");
+    tb_revoked_known[0] = 1;
+    cread(0, A, f);
+    chk(f, "CA7: cread succeeded after a tagged line was evicted");
+
+    // CA8: a trap revokes when lines are tagged, and only then
+    untag_all(0);
+    cread(0, A, f);
+    do_trap(0);
+    cread(0, B, f);
+    chk(f, "CA8: cread succeeded after a trap");
+    untag_all(0);
+    do_trap(0);
+    cread(0, A, f);
+    chk(!f, "CA8: a trap with nothing tagged revoked access");
+
+    // CA9: a squashed cread tags nothing
+    untag_all(0);
+    cread(0, A, f);
+    do_ca(0, wt_cache_pkg::CA_CREAD, B, 0, d, fb, idb, snb);
+    @(negedge clk);
+    ca_flush[0] = 1'b1;
+    @(negedge clk);
+    ca_flush[0] = 1'b0;
+    do_store(1, B, 32'hca00_0009);
+    cwrite(0, A, 32'hca00_0010, f);
+    chk(!f, "CA9: a squashed cread revoked access");
+
+    // CA10: while an untagAll is pending, no CA operation is accepted; the
+    // cread after it then sees the cleared state
+    untag_all(0);
+    cread(0, A, f);
+    do_store(1, A, 32'hca00_0011);  // revokes
+    do_ca(0, wt_cache_pkg::CA_UNTAG_ALL, BASE, 0, d, f, idu, snu);
+    cread_done = 0;
     fork
-      agent_load(0, n_ops, nsets, ntags);
-      agent_store(0, n_ops, nsets, ntags);
-      agent_atomic(0, n_ops / 8, nsets, ntags);
-      agent_load(1, n_ops, nsets, ntags);
-      agent_store(1, n_ops, nsets, ntags);
-      agent_atomic(1, n_ops / 8, nsets, ntags);
+      begin
+        cread(0, B, fb);
+        cread_done = 1;
+      end
+      begin
+        repeat (20) @(negedge clk);
+        chk(!cread_done, "CA10: cread accepted while an untagAll was pending");
+        ca_committed(0, wt_cache_pkg::CA_UNTAG_ALL, BASE, 0, idu, snu, 1);
+      end
     join
+    chk(!fb, "CA10: cread after untagAll failed");
+
+    // CA11: a cread fails when an older, uncommitted cread already lost its line
+    untag_all(0);
+    do_ca(0, wt_cache_pkg::CA_CREAD, A, 0, d, fa, ida, sna);
+    do_store(1, A, 32'hca00_0012);
+    do_ca(0, wt_cache_pkg::CA_CREAD, B, 0, d, fb, idb, snb);
+    chk(!fa, "CA11: first cread failed");
+    chk(fb, "CA11: cread succeeded after an older pending cread lost its line");
+    ca_committed(0, wt_cache_pkg::CA_CREAD, A, fa, ida, sna, 1);
+    ca_committed(0, wt_cache_pkg::CA_CREAD, B, fb, idb, snb, 1);
+    chk(ca_status[0] == 2'b11, $sformatf("CA11: status %b, expected 11", ca_status[0]));
+    untag_all(0);
+  endtask
+
+  // both cores run CA sequences (untagAll, creads, maybe cwrite) and plain
+  // traffic on the same few lines
+  task automatic ca_agent(input int c, input int unsigned n, input int unsigned nsets,
+                          input int unsigned ntags);
+    for (int i = 0; i < n; i++) begin
+      logic [63:0] a[3];
+      logic [31:0] d;
+      bit f, ok;
+      int unsigned k;
+      case ($urandom_range(5))
+        0, 1, 2: begin
+          untag_all(c);
+          k = $urandom_range(1, 3);
+          ok = 1;
+          for (int j = 0; j < k && ok; j++) begin
+            a[j] = la(90 + $urandom_range(nsets - 1), $urandom_range(ntags - 1), $urandom_range(3));
+            cread(c, a[j], f);
+            ok = !f;
+          end
+          if (ok && $urandom_range(3) == 0) untag_one(c, a[0]);
+          if (ok && $urandom_range(1)) cwrite(c, a[$urandom_range(k - 1)], $urandom, f);
+          if ($urandom_range(1)) repeat ($urandom_range(30)) @(negedge clk);
+        end
+        3: do_store(c, la(90 + $urandom_range(nsets - 1), $urandom_range(ntags - 1),
+                         $urandom_range(3)), $urandom);
+        4: do_amo(c, AMO_ADD, la(90 + $urandom_range(nsets - 1), $urandom_range(ntags - 1),
+                                 $urandom_range(3)), 1, d);
+        default: do_load(c, la(90 + $urandom_range(nsets - 1), $urandom_range(ntags - 1),
+                               $urandom_range(3)), d);
+      endcase
+    end
+  endtask
+
+  int unsigned spurious_before[NC];
+
+  // ------------------
+  // Parallel agents without fork/join: Verilator 5.032 asserts on some
+  // fork/join sequences, so every (core, role) has a worker process that
+  // starts on a flag and the main process waits for all of them
+  // ------------------
+  localparam int unsigned NROLES = 4;  // 0 load, 1 store, 2 atomic, 3 CA
+  bit worker_go[NC][NROLES];
+  int unsigned worker_n, worker_nsets, worker_ntags;
+
+  for (genvar c = 0; c < NC; c++) begin : gen_workers
+    for (genvar r = 0; r < NROLES; r++) begin : gen_role
+      initial begin
+        forever begin
+          wait (worker_go[c][r]);
+          case (r)
+            0: agent_load(c, worker_n, worker_nsets, worker_ntags);
+            1: agent_store(c, worker_n, worker_nsets, worker_ntags);
+            2: agent_atomic(c, worker_n / 8, worker_nsets, worker_ntags);
+            default: ca_agent(c, worker_n, worker_nsets, worker_ntags);
+          endcase
+          worker_go[c][r] = 1'b0;
+        end
+      end
+    end
+  end
+
+  task automatic run_workers(input bit roles[NROLES], input int unsigned n, input int unsigned nsets,
+                             input int unsigned ntags);
+    worker_n = n;
+    worker_nsets = nsets;
+    worker_ntags = ntags;
+    for (int c = 0; c < NC; c++) for (int r = 0; r < NROLES; r++) worker_go[c][r] = roles[r];
+    for (int c = 0; c < NC; c++) for (int r = 0; r < NROLES; r++) wait (!worker_go[c][r]);
+  endtask
+
+  task automatic test_ca_random_begin(input int unsigned n);
+    $display("[%0t] T6: conditional access, random, %0d steps per core", $time, n);
+    for (int c = 0; c < NC; c++) spurious_before[c] = n_ca_spurious[c];
+  endtask
+
+  // the fork lives in the main process: Verilator 5.032 asserts on some
+  // fork/join nestings inside tasks
+  task automatic test_ca_random_end();
+    // precision: without evictions, overflow, traps or pending creads every
+    // failure must come from an invalidation of a tagged line (paper)
+    for (int c = 0; c < NC; c++)
+    if (n_ca_spurious[c] != spurious_before[c])
+      error($sformatf("core %0d: %0d CA failures without a revoking event", c,
+                      n_ca_spurious[c] - spurious_before[c]));
+    untag_all(0);
+    untag_all(1);
   endtask
 
   // ------------------
@@ -816,7 +1322,11 @@ module std_nbdcache_2core_tb;
       req_ports_i[c] = '0;
       amo_req[c] = '0;
       tb_resv_line[c] = '1;
+      ca_commit_valid[c] = '0;
+      ca_commit_id[c] = '0;
     end
+    ca_flush = '0;
+    ca_trap = '0;
     repeat (3) @(negedge clk);
     rst_n = 1'b1;
     settle();
@@ -824,6 +1334,10 @@ module std_nbdcache_2core_tb;
     test_handoff();
     test_simultaneous_getm(30);
     test_counters(60);
+    test_ca_directed();
+    test_ca_random_begin(n_random / 2);
+    run_workers('{default: 1'b0, 3: 1'b1}, n_random / 2, 2, 4);
+    test_ca_random_end();
     // one random configuration per run: Verilator 5.032 asserts when a task
     // with fork/join is entered twice
     if ($test$plusargs("hot")) test_random(n_random, 1, 2);  // two hot lines
@@ -839,6 +1353,9 @@ module std_nbdcache_2core_tb;
     $display("coverage: loads=%0d/%0d stores=%0d/%0d amos=%0d/%0d sc ok=%0d/%0d sc fail=%0d/%0d",
              n_ld[0], n_ld[1], n_st[0], n_st[1], n_amo[0], n_amo[1], n_sc_ok[0], n_sc_ok[1],
              n_sc_fail[0], n_sc_fail[1]);
+    $display("coverage: cread ok=%0d/%0d fail=%0d/%0d, cwrite ok=%0d/%0d fail=%0d/%0d, unexplained CA failures=%0d/%0d",
+             n_cread_ok[0], n_cread_ok[1], n_cread_fail[0], n_cread_fail[1], n_cwrite_ok[0],
+             n_cwrite_ok[1], n_cwrite_fail[0], n_cwrite_fail[1], n_ca_spurious[0], n_ca_spurious[1]);
     $display("coverage: AXI line writes=%0d reads=%0d, SWMR checks=%0d, max times passed over=%0d",
              n_axi_writes, n_axi_reads, n_swmr_checks, max_skipped);
     if (n_errors != 0) $fatal(1, "FAILED with %0d errors", n_errors);
@@ -857,6 +1374,11 @@ module std_nbdcache_2core_tb;
                  gen_core[1].dut.i_miss_handler.state_q, i_bus.state_q, bus_owner, cc_req[1].valid,
                  cc_req[0].valid, cc_gnt, cc_done, {snoop[1].valid, snoop[0].valid}, snoop_ready,
                  snoop_ack, amo_req[1].req, amo_req[0].req);
+        if ($test$plusargs("cadebug"))
+          $display("[%0t]   ca0: inval=%b all=%b addr=%h snp_inval=%b status=%b revoked_eff=%b", $time,
+                   gen_core[0].dut.ca_inval_valid, gen_core[0].dut.ca_inval_all,
+                   gen_core[0].dut.ca_inval_addr, gen_core[0].dut.ca_snoop_inval_valid, ca_status[0],
+                   gen_core[0].dut.ca_revoked);
       end
     end
   end

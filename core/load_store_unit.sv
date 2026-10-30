@@ -798,7 +798,8 @@ module load_store_unit
                 AMO_LRW, AMO_SCW,
                 AMO_SWAPW, AMO_ADDW, AMO_ANDW, AMO_ORW,
                 AMO_XORW, AMO_MAXW, AMO_MAXWU, AMO_MINW,
-                AMO_MINWU, HLV_W, HLV_WU, HLVX_WU, HSV_W: begin
+                AMO_MINWU, HLV_W, HLV_WU, HLVX_WU, HSV_W,
+                CREAD, CWRITE: begin
           if (lsu_ctrl.vaddr[1:0] != 2'b00) begin
             data_misaligned = 1'b1;
           end

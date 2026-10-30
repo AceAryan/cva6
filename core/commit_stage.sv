@@ -135,7 +135,9 @@ module commit_stage
 
   logic instr_0_is_amo;
   logic [CVA6Cfg.NrCommitPorts-1:0] commit_macro_ack;
-  assign instr_0_is_amo = is_amo(commit_instr_i[0].op);
+  // with the write-back cache, cwrite commits through the AMO path
+  assign instr_0_is_amo = is_amo(commit_instr_i[0].op) ||
+      (CVA6Cfg.DCacheType == config_pkg::WB && commit_instr_i[0].op == ariane_pkg::CWRITE);
   // -------------------
   // Commit Instruction
   // -------------------

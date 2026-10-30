@@ -138,7 +138,12 @@ module store_unit
   logic st_valid;
   logic st_valid_without_flush;
   logic instr_is_amo;
-  assign instr_is_amo = is_amo(lsu_ctrl_i.operation);
+  // with the write-back cache, cwrite executes at commit through the AMO path
+  // so that its tag check and its store are one atomic step
+  logic instr_is_cwrite_amo;
+  assign instr_is_cwrite_amo = (CVA6Cfg.DCacheType == config_pkg::WB) &&
+      (lsu_ctrl_i.operation == ariane_pkg::CWRITE);
+  assign instr_is_amo = is_amo(lsu_ctrl_i.operation) || instr_is_cwrite_amo;
   // keep the data and the byte enable for the second cycle (after address translation)
   logic [CVA6Cfg.XLEN-1:0] st_data_n, st_data_q;
   logic [(CVA6Cfg.XLEN/8)-1:0] st_be_n, st_be_q;
@@ -314,7 +319,7 @@ module store_unit
         AMO_MAXWU, AMO_MAXDU: amo_op_d = AMO_MAXU;
         AMO_MINW, AMO_MIND:   amo_op_d = AMO_MIN;
         AMO_MINWU, AMO_MINDU: amo_op_d = AMO_MINU;
-        default:              amo_op_d = AMO_NONE;
+        default:              amo_op_d = instr_is_cwrite_amo ? AMO_CWRITE : AMO_NONE;
       endcase
     end else begin
       amo_op_d = AMO_NONE;
@@ -331,7 +336,7 @@ module store_unit
       cbo_op_d = ariane_pkg::CBO_NONE;
     end
 
-    ca_op_d = (lsu_ctrl_i.operation == ariane_pkg::CWRITE) ?
+    ca_op_d = (lsu_ctrl_i.operation == ariane_pkg::CWRITE && !instr_is_cwrite_amo) ?
         wt_cache_pkg::CA_CWRITE : wt_cache_pkg::CA_NONE;
   end
 

@@ -75,7 +75,16 @@ module miss_handler
     // Snoops from the coherence bus
     input cc_snoop_t snoop_i,  // held until snoop_ready_o
     output logic snoop_ready_o,
-    output logic snoop_ack_o  // single-cycle, line state updated and write-back complete
+    output logic snoop_ack_o,  // single-cycle, line state updated and write-back complete
+    // Conditional access: lines leaving this cache, and cwrite at commit
+    output logic ca_inval_valid_o,  // local eviction/flush of a line
+    output logic ca_inval_all_o,
+    output logic [55:0] ca_inval_addr_o,
+    output logic ca_snoop_inval_valid_o,  // another core takes a line we hold
+    output logic [55:0] ca_snoop_inval_addr_o,
+    output logic [55:0] ca_cwrite_addr_o,
+    input logic ca_cwrite_allowed_i,
+    output logic ca_cwrite_fail_o
 );
 
   // Three MSHR ports + AMO port
@@ -299,13 +308,25 @@ module miss_handler
     lr_hold_d                   = lr_hold_q;
     any_miss_req                = |(miss_req_valid & ~miss_req_bypass);
     sc_ok = resv_valid_q && resv_addr_q == mshr_q.addr[55:CVA6Cfg.DCACHE_OFFSET_WIDTH];
+    ca_inval_valid_o            = 1'b0;
+    ca_inval_all_o              = 1'b0;
+    ca_inval_addr_o             = '0;
+    ca_snoop_inval_valid_o      = 1'b0;
+    ca_snoop_inval_addr_o       = snoop_q.addr;
+    ca_cwrite_fail_o            = 1'b0;
 
     case (state_q)
 
       IDLE: begin
         // lowest priority are AMOs, wait until everything else is served before going for the AMOs
         if (amo_req_i.req && !busy_i) begin
-          if (amo_cacheable) begin
+          if (amo_req_i.amo_op == AMO_CWRITE && (!ca_cwrite_allowed_i || !amo_cacheable)) begin
+            // not tagged, access revoked, or not cacheable (tags live in the
+            // L1): fail without touching the bus
+            amo_resp_o.ack    = 1'b1;
+            amo_resp_o.result = 64'd1;
+            ca_cwrite_fail_o  = 1'b1;
+          end else if (amo_cacheable) begin
             // execute in the cache once the line is held in M; the MSHR holds
             // off the ports from the line meanwhile
             state_d      = AMO_BUS_REQ;
@@ -410,6 +431,13 @@ module miss_handler
           if ({data_i[lfsr_bin].tag, mshr_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH]} ==
               resv_addr_q)
             resv_valid_d = 1'b0;
+          // an evicted tagged line revokes conditional access
+          ca_inval_valid_o = 1'b1;
+          ca_inval_addr_o = {
+            data_i[lfsr_bin].tag,
+            mshr_q.addr[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH],
+            {{CVA6Cfg.DCACHE_OFFSET_WIDTH} {1'b0}}
+          };
           // do we need to write back the cache line?
           if (data_i[lfsr_bin].dirty) begin
             state_d = WB_CACHELINE_MISS;
@@ -504,6 +532,10 @@ module miss_handler
           req_o        = 1'b1;
           we_o         = 1'b1;
           data_o.valid = INVALIDATE_ON_FLUSH ? 1'b0 : 1'b1;
+          if (INVALIDATE_ON_FLUSH && state_q == WB_CACHELINE_FLUSH) begin
+            ca_inval_valid_o = 1'b1;
+            ca_inval_all_o   = 1'b1;
+          end
           // invalidate
           be_o.vldrty  = evict_way_q;
           // go back to handling the miss or flushing, depending on where we came from
@@ -580,6 +612,8 @@ module miss_handler
           req_o       = 1'b1;
           be_o.vldrty = INVALIDATE_ON_FLUSH ? '1 : '0;
           we_o        = 1'b1;
+          ca_inval_valid_o = INVALIDATE_ON_FLUSH;
+          ca_inval_all_o   = INVALIDATE_ON_FLUSH;
           // finished with flushing operation, go back to idle
           if (cnt_q[CVA6Cfg.DCACHE_INDEX_WIDTH-1:CVA6Cfg.DCACHE_OFFSET_WIDTH] == CVA6Cfg.DCACHE_NUM_WORDS - 1) begin
             // only acknowledge if the flush wasn't triggered by an atomic
@@ -724,6 +758,8 @@ module miss_handler
         be_o.vldrty  = snoop_way_q;
         data_o.valid = (snoop_q.req_type == CC_GETS);
         snoop_ack_o  = 1'b1;
+        // another core writes a line we hold: a tagged one revokes access
+        ca_snoop_inval_valid_o = (snoop_q.req_type == CC_GETM);
         state_d      = snoop_ret_q;
         // another core writes the reserved line
         if (snoop_q.req_type == CC_GETM && snoop_q.addr[55:CVA6Cfg.DCACHE_OFFSET_WIDTH] == resv_addr_q)
@@ -757,7 +793,17 @@ module miss_handler
       // ~> no snoop can come in while we hold the tenure, so the look-up and
       //    the write below are atomic
       AMO_EXEC: begin
-        if (amo_req_i.amo_op == AMO_SC && !sc_ok) begin
+        if (amo_req_i.amo_op == AMO_CWRITE && !ca_cwrite_allowed_i) begin
+          // revoked while we waited for the tenure: fail without writing
+          amo_resp_o.ack    = 1'b1;
+          amo_resp_o.result = 64'd1;
+          ca_cwrite_fail_o  = 1'b1;
+          mshr_d.valid      = 1'b0;
+          amo_mshr_d        = 1'b0;
+          cc_done_o         = 1'b1;
+          bus_held_d        = 1'b0;
+          state_d           = IDLE;
+        end else if (amo_req_i.amo_op == AMO_SC && !sc_ok) begin
           // reservation lost (or never taken): fail without writing
           amo_resp_o.ack    = 1'b1;
           amo_resp_o.result = 64'd1;
@@ -791,7 +837,7 @@ module miss_handler
             resv_valid_d = 1'b0;
           end
           amo_resp_o.ack    = 1'b1;
-          amo_resp_o.result = (amo_req_i.amo_op == AMO_SC) ? 64'd0 : amo_ret;
+          amo_resp_o.result = (amo_req_i.amo_op inside {AMO_SC, AMO_CWRITE}) ? 64'd0 : amo_ret;
           mshr_d.valid      = 1'b0;
           amo_mshr_d        = 1'b0;
           if (amo_req_i.amo_op == AMO_LR) begin
@@ -872,14 +918,18 @@ module miss_handler
     end
   end
 
+  logic [63:0] amo_alu_result;
   amo_alu #(
       .CVA6Cfg(CVA6Cfg)
   ) i_amo_alu (
       .amo_op_i       (amo_req_i.amo_op),
       .amo_operand_a_i(amo_operand_a_ext),
       .amo_operand_b_i(amo_operand_b_ext),
-      .amo_result_o   (amo_new)
+      .amo_result_o   (amo_alu_result)
   );
+  // a cwrite stores its operand
+  assign amo_new = (amo_req_i.amo_op == AMO_CWRITE) ? amo_operand_b_ext : amo_alu_result;
+  assign ca_cwrite_addr_o = amo_req_i.operand_a[55:0];
 
   // check MSHR for aliasing
   logic [55:0] snoop_set_addr;

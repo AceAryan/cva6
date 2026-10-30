@@ -407,6 +407,7 @@ module cva6
   logic [CVA6Cfg.NrCommitPorts-1:0] commit_ack;
   logic [CVA6Cfg.NrCommitPorts-1:0] commit_macro_ack;
   logic [CVA6Cfg.NrCommitPorts-1:0] ca_commit_valid;
+  logic [1:0] ca_status;  // {accessRevokedBit, CAFAIL} for the cafail CSR
   logic [CVA6Cfg.NrCommitPorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] ca_commit_id;
   logic mbe;  // determines the data endian-ness of the processor
 
@@ -1340,6 +1341,7 @@ module cva6
       .rvfi_csr_o                         (rvfi_csr),
       // Trigger Signals
       .sdtrig_commit_std_exception_valid_o(sdtrig_commit_std_exception_valid),
+      .ca_status_i                        (ca_status),
       //Decoder/FE <-> Trigger Module
       .fetch_sdtrig_pc_i                  (fetch_sdtrig_pc),
       .fetch_sdtrig_instr_i               (fetch_sdtrig_instr),
@@ -1559,7 +1561,8 @@ module cva6
     assign dcache_dat_unc_err_csr = 1'b0;
     assign dcache_dir_cor_err_csr = 1'b0;
     assign dcache_dir_unc_err_csr = 1'b0;
-    // no MSI coherence on this cache
+    // no MSI coherence or cafail CSR on this cache
+    assign ca_status     = '0;
     assign cc_req_o      = '0;
     assign cc_done_o     = 1'b0;
     assign snoop_ready_o = 1'b0;
@@ -1637,7 +1640,8 @@ module cva6
     );
     assign inval_ready   = 1'b1;
     assign miss_vld_bits = '0;
-    // no MSI coherence on this cache
+    // no MSI coherence or cafail CSR on this cache
+    assign ca_status     = '0;
     assign cc_req_o      = '0;
     assign cc_done_o     = 1'b0;
     assign snoop_ready_o = 1'b0;
@@ -1705,7 +1709,14 @@ module cva6
         .cc_done_o         (cc_done_o),
         .snoop_i           (cc_snoop),
         .snoop_ready_o     (snoop_ready_o),
-        .snoop_ack_o       (snoop_ack_o)
+        .snoop_ack_o       (snoop_ack_o),
+        // conditional access: CA operations are recorded speculatively and
+        // take effect at commit; any trap revokes access
+        .ca_flush_i        (flush_ctrl_ex | flush_commit),
+        .ca_commit_valid_i (ca_commit_valid),
+        .ca_commit_id_i    (ca_commit_id),
+        .ca_trap_i         (ex_commit.valid),
+        .ca_status_o       (ca_status)
     );
     assign dcache_commit_wbuffer_not_ni = 1'b1;
     assign dcache_scrub_cycle_csr       = 1'b0;

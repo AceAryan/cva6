@@ -667,7 +667,8 @@ package ariane_pkg;
     AMO_MIN  = 4'b1010,
     AMO_MINU = 4'b1011,
     AMO_CAS1 = 4'b1100,  // unused, not part of riscv spec, but provided in OpenPiton
-    AMO_CAS2 = 4'b1101   // unused, not part of riscv spec, but provided in OpenPiton
+    AMO_CAS2 = 4'b1101,  // unused, not part of riscv spec, but provided in OpenPiton
+    AMO_CWRITE = 4'b1110  // conditional-access cwrite, executed at commit like an AMO (WB cache)
   } amo_t;
 
   // Bits required for representation of physical address space as 4K pages
@@ -810,7 +811,8 @@ package ariane_pkg;
             AMO_ANDW,  AMO_ORW,
             AMO_XORW,  AMO_MAXW,
             AMO_MAXWU, AMO_MINW,
-            AMO_MINWU: begin
+            AMO_MINWU,
+            CREAD, CWRITE: begin
         return 2'b10;
       end
       LH, LHU, HLV_H, HLV_HU, HLVX_HU, SH, HSV_H, FLH, FSH: return 2'b01;

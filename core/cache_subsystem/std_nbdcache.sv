@@ -48,8 +48,18 @@ module std_nbdcache
     output logic cc_done_o,
     input cc_snoop_t snoop_i,
     output logic snoop_ready_o,
-    output logic snoop_ack_o
+    output logic snoop_ack_o,
+    // Conditional access
+    input logic ca_flush_i,  // drop uncommitted CA operations
+    input logic [CVA6Cfg.NrCommitPorts-1:0] ca_commit_valid_i,
+    input logic [CVA6Cfg.NrCommitPorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] ca_commit_id_i,
+    input logic ca_trap_i,  // a trap is taken: revoke access if lines are tagged
+    output logic [1:0] ca_status_o  // {accessRevokedBit, CAFAIL}
 );
+
+  // the load unit's port carries cread/untagOne/untagAll
+  localparam int unsigned CaPort = 1;
+  localparam int unsigned CaTagSetDepth = 8;
 
   import std_cache_pkg::*;
 
@@ -99,6 +109,17 @@ module std_nbdcache
   logic        [                  NumPorts-1:0][         $bits(miss_req_t)-1:0] miss_req;
   logic        [                  NumPorts-1:0]                                 miss_gnt;
   logic        [                  NumPorts-1:0]                                 active_serving;
+
+  // -------------------------------
+  // Conditional access
+  // -------------------------------
+  logic ca_block, ca_revoked, ca_access_revoked, ca_cafail;
+  logic [NumPorts-1:0] ca_issue, ca_fail;
+  wt_cache_pkg::ca_op_t [NumPorts-1:0] ca_issue_op;
+  logic [NumPorts-1:0][CVA6Cfg.TRANS_ID_BITS-1:0] ca_issue_id, ca_fail_id;
+  logic [NumPorts-1:0][CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:0] ca_issue_addr;
+  logic ca_inval_valid, ca_inval_all, ca_snoop_inval_valid, ca_cwrite_allowed, ca_cwrite_fail;
+  logic [55:0] ca_inval_addr, ca_snoop_inval_addr, ca_cwrite_addr;
 
   logic        [                  NumPorts-1:0]                                 bypass_gnt;
   logic        [                  NumPorts-1:0]                                 bypass_valid;
@@ -153,6 +174,15 @@ module std_nbdcache
           .mshr_addr_o         (mshr_addr[i]),
           .mshr_addr_matches_i (mshr_addr_matches[i]),
           .mshr_index_matches_i(mshr_index_matches[i]),
+
+          .ca_block_i     ((i == CaPort) ? ca_block : 1'b0),
+          .ca_revoked_i   ((i == CaPort) ? ca_revoked : 1'b0),
+          .ca_issue_o     (ca_issue[i]),
+          .ca_issue_op_o  (ca_issue_op[i]),
+          .ca_issue_id_o  (ca_issue_id[i]),
+          .ca_issue_addr_o(ca_issue_addr[i]),
+          .ca_fail_o      (ca_fail[i]),
+          .ca_fail_id_o   (ca_fail_id[i]),
           .*
       );
     end
@@ -197,6 +227,14 @@ module std_nbdcache
       .snoop_i,
       .snoop_ready_o,
       .snoop_ack_o,
+      .ca_inval_valid_o      (ca_inval_valid),
+      .ca_inval_all_o        (ca_inval_all),
+      .ca_inval_addr_o       (ca_inval_addr),
+      .ca_snoop_inval_valid_o(ca_snoop_inval_valid),
+      .ca_snoop_inval_addr_o (ca_snoop_inval_addr),
+      .ca_cwrite_addr_o      (ca_cwrite_addr),
+      .ca_cwrite_allowed_i   (ca_cwrite_allowed),
+      .ca_cwrite_fail_o      (ca_cwrite_fail),
       .axi_bypass_o,
       .axi_bypass_i,
       .axi_data_o,
@@ -205,6 +243,39 @@ module std_nbdcache
   );
 
   assign tag[0] = '0;
+
+  ca_tag_set #(
+      .DEPTH           (CaTagSetDepth),
+      .ADDR_WIDTH      (CVA6Cfg.DCACHE_TAG_WIDTH + CVA6Cfg.DCACHE_INDEX_WIDTH),
+      .LINE_OFFSET_BITS(CVA6Cfg.DCACHE_OFFSET_WIDTH),
+      .ID_WIDTH        (CVA6Cfg.TRANS_ID_BITS),
+      .NUM_COMMIT_PORTS(CVA6Cfg.NrCommitPorts)
+  ) i_ca_tag_set (
+      .clk_i                   (clk_i),
+      .rst_ni                  (rst_ni),
+      .flush_i                 (ca_flush_i),
+      .issue_valid_i           (ca_issue[CaPort]),
+      .issue_op_i              (ca_issue_op[CaPort]),
+      .issue_id_i              (ca_issue_id[CaPort]),
+      .issue_addr_i            (ca_issue_addr[CaPort]),
+      .cread_fail_valid_i      (ca_fail[CaPort]),
+      .cread_fail_id_i         (ca_fail_id[CaPort]),
+      .commit_valid_i          (ca_commit_valid_i),
+      .commit_id_i             (ca_commit_id_i),
+      .invalidate_valid_i      (ca_inval_valid | ca_trap_i),
+      .invalidate_all_i        (ca_inval_all | ca_trap_i),
+      .invalidate_addr_i       (ca_inval_addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:0]),
+      .snoop_invalidate_valid_i(ca_snoop_inval_valid),
+      .snoop_invalidate_addr_i (ca_snoop_inval_addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:0]),
+      .cwrite_addr_i           (ca_cwrite_addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:0]),
+      .cwrite_allowed_o        (ca_cwrite_allowed),
+      .cwrite_fail_i           (ca_cwrite_fail),
+      .cread_revoked_o         (ca_revoked),
+      .untag_all_pending_o     (ca_block),
+      .access_revoked_o        (ca_access_revoked),
+      .cafail_o                (ca_cafail)
+  );
+  assign ca_status_o = {ca_access_revoked, ca_cafail};
 
   // --------------
   // Memory Arrays
