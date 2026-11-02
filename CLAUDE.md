@@ -105,6 +105,27 @@ CVA6_REPO_DIR=$PWD TARGET_CFG=<cfg> HPDCACHE_DIR=$PWD/core/cache_subsystem/hpdca
   --top-module cva6 -f core/Flist.cva6
 ```
 
+### KR260 FPGA (`corev_apu/fpga/kr260/`)
+
+Vivado 2023.2 is on Windows at `D:\Vivado\2023.2` and is called from WSL. The build directory is `D:\cva6_kr260`.
+
+```sh
+corev_apu/fpga/kr260/kr260_build.sh [synth|impl]   # detached; ends with BUILD_DONE/BUILD_FAILED in /mnt/d/cva6_kr260/build.log
+OBJCOPY=/home/ace/tools/riscv/bin/riscv64-unknown-elf-objcopy \
+  corev_apu/fpga/kr260/kr260_run.sh <elf> [timeout_s]   # JTAG/xsdb; KR260_PROGRAM=1 reprograms the PL
+```
+
+- **Linking programs:** use `corev_apu/fpga/kr260/sw/link_kr260.ld`, which puts `tohost` in the uncached mailbox at 0xC000_0000.
+- **Address map:** the cores' 0x8000_0000 maps to PS DDR 0x4000_0000. The PS sees the mailbox at 0xA000_0000 and the run bit at 0xA001_0000.
+- **Simulate the exact FPGA RTL first:** use `sim/kr260_bd_wrapper_sim.sv` with `scripts/gen_filelist.sh`, then run `Vcva6_kr260_top +bin=<image>`.
+- **Lint for combinational loops before Vivado:** use `-Wwarn-UNOPTFLAT`. Vivado's DRC `LUTLP-1` stops bitstream generation on a loop.
+- **Benchmarks** (`sw/bench/`: lazy list, external BST, stack, hash table × none/ca/hp/qsbr, after the paper):
+  - Build with `build_all.sh <out> [NOPS]`.
+  - Run with `kr260_run.sh <elf> <timeout> <seed>`. Results are mailbox words 16..; `run_test.tcl` prints them as `MBOX`.
+  - Decode with `analyze.py <results.txt> <out>`.
+  - Results and summary: `~/logs/phase5/BENCHMARK_SUMMARY.md`.
+- **Stale reset:** after the board is reset or power-cycled, `xsdb` reports "PL reset is active". Rerun with `KR260_PROGRAM=1`.
+
 ### Full-core simulation (Verilator testharness + Spike)
 
 Requires `RISCV` (toolchain path) and the custom Spike/Verilator installed by the regress scripts.

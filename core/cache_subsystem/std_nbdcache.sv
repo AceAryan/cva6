@@ -244,6 +244,16 @@ module std_nbdcache
 
   assign tag[0] = '0;
 
+  // A trap revokes one cycle later: the commit stage decides on traps from
+  // the AMO acknowledge, which depends on the tag set, so a direct path would
+  // be a combinational loop. Nothing tagged can commit in between, as the trap
+  // flushes the pipeline.
+  logic ca_trap_q;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) ca_trap_q <= 1'b0;
+    else ca_trap_q <= ca_trap_i;
+  end
+
   ca_tag_set #(
       .DEPTH           (CaTagSetDepth),
       .ADDR_WIDTH      (CVA6Cfg.DCACHE_TAG_WIDTH + CVA6Cfg.DCACHE_INDEX_WIDTH),
@@ -262,8 +272,8 @@ module std_nbdcache
       .cread_fail_id_i         (ca_fail_id[CaPort]),
       .commit_valid_i          (ca_commit_valid_i),
       .commit_id_i             (ca_commit_id_i),
-      .invalidate_valid_i      (ca_inval_valid | ca_trap_i),
-      .invalidate_all_i        (ca_inval_all | ca_trap_i),
+      .invalidate_valid_i      (ca_inval_valid | ca_trap_q),
+      .invalidate_all_i        (ca_inval_all | ca_trap_q),
       .invalidate_addr_i       (ca_inval_addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:0]),
       .snoop_invalidate_valid_i(ca_snoop_inval_valid),
       .snoop_invalidate_addr_i (ca_snoop_inval_addr[CVA6Cfg.DCACHE_TAG_WIDTH+CVA6Cfg.DCACHE_INDEX_WIDTH-1:0]),
@@ -276,6 +286,7 @@ module std_nbdcache
       .cafail_o                (ca_cafail)
   );
   assign ca_status_o = {ca_access_revoked, ca_cafail};
+
 
   // --------------
   // Memory Arrays

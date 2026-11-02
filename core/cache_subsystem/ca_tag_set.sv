@@ -199,8 +199,11 @@ module ca_tag_set
         pending_lost = 1'b1;
       if (pending_valid_q[i] && pending_op_q[i] == CA_UNTAG_ALL) untag_all_pending_o = 1'b1;
     end
-    // cwrite: the address is tagged and access is not (being) revoked
-    cwrite_allowed_o = cwrite_allowed_o && !revoked_q && !tag_hit_now;
+    // cwrite: the address is tagged and access is not revoked. A cwrite is
+    // checked only while the miss handler is idle or holds its own tenure, so
+    // no invalidation can happen in the same cycle; leaving it out keeps the
+    // miss handler's outputs out of this input (no combinational loop)
+    cwrite_allowed_o = cwrite_allowed_o && !revoked_q;
     cread_revoked_o  = revoked_q || tag_hit_now || pending_lost;
     access_revoked_o = revoked_q;
     cafail_o         = cafail_q;
