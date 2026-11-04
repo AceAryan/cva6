@@ -123,6 +123,7 @@ OBJCOPY=/home/ace/tools/riscv/bin/riscv64-unknown-elf-objcopy \
   - Build with `build_all.sh <out> [NOPS]`.
   - Run with `kr260_run.sh <elf> <timeout> <seed>`. Results are mailbox words 16..; `run_test.tcl` prints them as `MBOX`.
   - Decode with `analyze.py <results.txt> <out>`.
+  - Plot with `plot.py <out>` (SVG, PNG and an `index.html`; no dependencies).
   - Results and summary: `~/logs/phase5/BENCHMARK_SUMMARY.md`.
 - **Stale reset:** after the board is reset or power-cycled, `xsdb` reports "PL reset is active". Rerun with `KR260_PROGRAM=1`.
 
